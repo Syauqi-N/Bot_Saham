@@ -1,0 +1,5 @@
+flask
+requests
+python-dotenv
+pandas
+git+https://github.com/rongardF/tvdatafeed.git
