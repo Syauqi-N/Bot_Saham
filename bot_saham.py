@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from tvDatafeed import Interval, TvDatafeed
 
+from ai_router import get_ai_reply
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -346,6 +348,7 @@ def help_text() -> str:
             "Catatan:",
             "- Data TradingView timeframe 1D",
             "- Output S/R berbasis pivot harian",
+            "- Bisa ngobrol bebas, bot akan jawab dengan gaya santai",
         ]
     )
 
@@ -365,7 +368,16 @@ def webhook() -> Any:
 
     command, symbol = parse_command(text)
     if not command:
-        return jsonify({"status": "ignored"})
+        ok, remaining = rate_limit_ok(chat_id)
+        if not ok:
+            send_text(chat_id, f"Mohon tunggu {remaining} detik sebelum request lagi.")
+            return jsonify({"status": "rate_limited"})
+        reply, error = get_ai_reply(chat_id, text)
+        if error or not reply:
+            send_text(chat_id, "AI lagi error. Coba lagi bentar ya.")
+            return jsonify({"status": "error"})
+        send_text(chat_id, reply)
+        return jsonify({"status": "ok"})
 
     ok, remaining = rate_limit_ok(chat_id)
     if not ok:

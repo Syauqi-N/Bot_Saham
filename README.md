@@ -6,6 +6,7 @@ Bot WhatsApp berbasis WAHA untuk cek harga saham IDX secara near-realtime lewat 
 - $KODE (contoh: $BBCA)
 - !ihsg
 - !help
+- Chat AI gaya santai (Groq)
 - Cache dan rate limit sederhana
 
 ## Prasyarat
@@ -165,6 +166,8 @@ docker exec -it backend-waha-1 curl -s http://172.17.0.1:5000/health
 - `WAHA_SESSION` default `default`
 - `TV_INTERVAL` default `1d`
 - `IHSG_SYMBOL` default `COMPOSITE` (ubah jika simbol IHSG berbeda)
+- `GROQ_API_KEY` API key Groq untuk chat AI
+- `GROQ_MODEL` default `groq/compound-mini`
 
 ## Troubleshooting
 - Jika sering gagal, pastikan kredensial TradingView benar.
