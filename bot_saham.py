@@ -3,7 +3,6 @@ import math
 import os
 import re
 import time
-from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -111,24 +110,6 @@ def format_number(value: Optional[float]) -> str:
     if value == int(value):
         return f"{int(value):,}"
     return f"{value:,.2f}"
-
-
-def format_time_value(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    try:
-        if hasattr(value, "to_pydatetime"):
-            value = value.to_pydatetime()
-        if isinstance(value, datetime):
-            return value.strftime("%Y-%m-%d %H:%M:%S")
-        if isinstance(value, str):
-            try:
-                return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                return value
-        return str(value)
-    except Exception:
-        return str(value)
 
 
 def format_change(change: Optional[float], pct: Optional[float]) -> str:
@@ -264,7 +245,7 @@ def fetch_sr_levels(symbol: str, exchange: str = "IDX") -> Tuple[Optional[Dict[s
     high = safe_float(bar.get("high"))
     low = safe_float(bar.get("low"))
     close = safe_float(bar.get("close"))
-    bar_time = format_time_value(bars.index[idx]) if len(bars.index) else None
+    bar_time = str(bars.index[idx]) if len(bars.index) else None
 
     if high is None or low is None or close is None or high == low:
         return None, "Data SR tidak valid."
