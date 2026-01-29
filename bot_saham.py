@@ -3,6 +3,7 @@ import math
 import os
 import re
 import time
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -117,6 +118,25 @@ def format_change(change: Optional[float], pct: Optional[float]) -> str:
         return "-"
     sign = "+" if change >= 0 else ""
     return f"{sign}{format_number(change)} ({sign}{pct:.2f}%)"
+
+
+def format_time_wib(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "to_pydatetime"):
+            value = value.to_pydatetime()
+        if isinstance(value, datetime):
+            return (value + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+                return (parsed + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
+            except ValueError:
+                return value
+        return str(value)
+    except Exception:
+        return str(value)
 
 
 def cache_get(key: str) -> Optional[Dict[str, Any]]:
@@ -291,7 +311,7 @@ def format_quote_text(
         f"Volume: {format_number(data.get('volume'))}",
     ]
     if data.get("timestamp"):
-        lines.append(f"Time: {data.get('timestamp')}")
+        lines.append(f"Time: {format_time_wib(data.get('timestamp'))}")
     if sr:
         lines.append("")
         lines.extend(
@@ -308,7 +328,7 @@ def format_quote_text(
                 "R2: {r2}".format(r2=format_number(sr.get("r2"))),
                 "R3: {r3}".format(r3=format_number(sr.get("r3"))),
                 "",
-                "⏱ {time}".format(time=sr.get("time") or "-"),
+                "⏱ {time}".format(time=format_time_wib(sr.get("time")) or "-"),
                 "© Haris Stockbit",
             ]
         )
