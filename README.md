@@ -134,6 +134,22 @@ Untuk dev, gunakan ngrok dan set webhook ke URL publik ngrok.
 - `!ihsg` → indeks IHSG
 - `!help` → daftar perintah
 
+## Docker Compose (Bot + WAHA)
+Siapkan `.env` lalu jalankan:
+```bash
+docker compose up -d --build
+```
+
+Buka dashboard WAHA:
+```
+http://localhost:3000/dashboard
+```
+
+Set webhook WAHA ke:
+```
+http://bot:5000/webhook
+```
+
 ## Tips Webhook (Docker)
 Jika bot berjalan di host dan WAHA di Docker, gunakan:
 - `http://host.docker.internal:5000/webhook`

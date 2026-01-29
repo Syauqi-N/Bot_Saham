@@ -1,0 +1,27 @@
+services:
+  bot:
+    build: .
+    container_name: bot-saham
+    env_file:
+      - .env
+    environment:
+      - WAHA_BASE_URL=http://waha:3000
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+  waha:
+    image: devlikeapro/waha:latest
+    container_name: waha
+    env_file:
+      - .env
+    environment:
+      - PORT=3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - waha_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  waha_data:
