@@ -18,7 +18,7 @@ def groq_chat(messages: List[Dict[str, str]], model: Optional[str] = None) -> Tu
         "model": model or GROQ_MODEL,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 800,
+        "max_tokens": 250,
     }
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",

@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 from typing import Dict, List, Optional, Tuple
 
 from groq_client import groq_chat
@@ -24,6 +25,12 @@ def get_ai_reply(chat_id: str, user_text: str) -> Tuple[Optional[str], Optional[
     reply, error = groq_chat(messages)
     if error:
         return None, error
+
+    reply = " ".join(reply.splitlines()).strip()
+    reply = re.sub(r"\s+", " ", reply)
+    sentences = re.split(r"(?<=[.!?])\s+", reply)
+    if len(sentences) > 4:
+        reply = " ".join(sentences[:4]).strip()
 
     updated = (history + [{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])[
         -MAX_HISTORY:
