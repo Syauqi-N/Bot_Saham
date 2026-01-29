@@ -6,7 +6,7 @@ Bot WhatsApp berbasis WAHA untuk cek harga saham IDX secara near-realtime lewat 
 - $KODE (contoh: $BBCA)
 - !ihsg
 - !help
-- Chat AI gaya santai (Groq)
+- Chat AI gaya santai via perintah `!ai` (Groq)
 - Cache dan rate limit sederhana
 
 ## Prasyarat
@@ -73,6 +73,7 @@ Kirim pesan ke nomor WAHA:
 - `$BBCA`
 - `!ihsg`
 - `!help`
+- `!ai woiii ini ihsg kenapa ancur gini`
 
 ## Contoh Output
 ```
@@ -134,6 +135,7 @@ Untuk dev, gunakan ngrok dan set webhook ke URL publik ngrok.
 - `$BBCA` → quote saham + support/resistance 1D
 - `!ihsg` → indeks IHSG
 - `!help` → daftar perintah
+- `!ai <teks>` → chat AI (contoh: `!ai woiii ini ihsg kenapa ancur gini`)
 
 ## Docker Compose (Bot + WAHA)
 Siapkan `.env` lalu jalankan:

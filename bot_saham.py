@@ -163,6 +163,8 @@ def parse_command(text: str) -> Tuple[Optional[str], Optional[str]]:
         return "help", None
     if re.match(r"^!ihsg\b", lower):
         return "ihsg", None
+    if re.match(r"^!ai\b", lower):
+        return "ai", cleaned
     match = re.match(r"^\$([a-z0-9\\.]+)", lower)
     if match:
         symbol = match.group(1).upper()
@@ -344,11 +346,12 @@ def help_text() -> str:
             "1) Kirim kode saham dengan format: $KODE (contoh: $BBCA)",
             "2) Lihat IHSG: !ihsg",
             "3) Lihat bantuan: !help",
+            "4) Chat AI: !ai <teks> (contoh: !ai woiii ini ihsg kenapa ancur gini)",
             "",
             "Catatan:",
             "- Data TradingView timeframe 1D",
             "- Output S/R berbasis pivot harian",
-            "- Bisa ngobrol bebas, bot akan jawab dengan gaya santai",
+            "- AI hanya aktif jika pakai perintah !ai",
         ]
     )
 
@@ -368,16 +371,7 @@ def webhook() -> Any:
 
     command, symbol = parse_command(text)
     if not command:
-        ok, remaining = rate_limit_ok(chat_id)
-        if not ok:
-            send_text(chat_id, f"Mohon tunggu {remaining} detik sebelum request lagi.")
-            return jsonify({"status": "rate_limited"})
-        reply, error = get_ai_reply(chat_id, text)
-        if error or not reply:
-            send_text(chat_id, "AI lagi error. Coba lagi bentar ya.")
-            return jsonify({"status": "error"})
-        send_text(chat_id, reply)
-        return jsonify({"status": "ok"})
+        return jsonify({"status": "ignored"})
 
     ok, remaining = rate_limit_ok(chat_id)
     if not ok:
@@ -386,6 +380,18 @@ def webhook() -> Any:
 
     if command == "help":
         send_text(chat_id, help_text())
+        return jsonify({"status": "ok"})
+
+    if command == "ai":
+        ai_text = re.sub(r"^!ai\\s*", "", text, flags=re.IGNORECASE).strip()
+        if not ai_text:
+            send_text(chat_id, "Ketik: !ai <teks>")
+            return jsonify({"status": "ok"})
+        reply, error = get_ai_reply(chat_id, ai_text)
+        if error or not reply:
+            send_text(chat_id, "AI lagi error. Coba lagi bentar ya.")
+            return jsonify({"status": "error"})
+        send_text(chat_id, reply)
         return jsonify({"status": "ok"})
 
     if command == "ihsg":
