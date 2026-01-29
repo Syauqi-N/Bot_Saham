@@ -243,9 +243,33 @@ def fetch_quote(symbol: str, exchange: str = "IDX") -> Tuple[Optional[Dict[str, 
         "volume": safe_float(last.get("volume")),
         "timestamp": str(last.name) if last is not None else None,
         "prev_close": prev_close,
+        "prev_open": safe_float(prev.get("open")) if prev is not None else None,
+        "prev_high": safe_float(prev.get("high")) if prev is not None else None,
+        "prev_low": safe_float(prev.get("low")) if prev is not None else None,
+        "prev_time": str(prev.name) if prev is not None else None,
     }
     cache_set(cache_key, data)
     return data, None
+
+
+def compute_sr_from_ohlc(high: Optional[float], low: Optional[float], close: Optional[float]) -> Optional[Dict[str, Any]]:
+    if high is None or low is None or close is None or high == low:
+        return None
+    pivot = (high + low + close) / 3
+    r1 = (2 * pivot) - low
+    s1 = (2 * pivot) - high
+    r2 = pivot + (high - low)
+    s2 = pivot - (high - low)
+    r3 = high + 2 * (pivot - low)
+    s3 = low - 2 * (high - pivot)
+    return {
+        "s1": s1,
+        "s2": s2,
+        "s3": s3,
+        "r1": r1,
+        "r2": r2,
+        "r3": r3,
+    }
 
 
 def fetch_sr_levels(symbol: str, exchange: str = "IDX") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -408,11 +432,13 @@ def webhook() -> Any:
         if error or data is None:
             send_text(chat_id, error or "Data tidak tersedia.")
             return jsonify({"status": "error"})
-        sr_data = None
-        sr_data, sr_error = fetch_sr_levels(symbol, exchange="IDX")
-        if sr_error:
-            logger.warning("SR error for %s: %s", symbol, sr_error)
-            sr_data = None
+        sr_data = compute_sr_from_ohlc(data.get("prev_high"), data.get("prev_low"), data.get("prev_close"))
+        if sr_data:
+            sr_data["time"] = data.get("prev_time")
+        else:
+            sr_data = compute_sr_from_ohlc(data.get("high"), data.get("low"), data.get("close"))
+            if sr_data:
+                sr_data["time"] = data.get("timestamp")
         message = format_quote_text(symbol, "IDX", data, sr=sr_data)
         send_text(chat_id, message)
         return jsonify({"status": "ok"})
