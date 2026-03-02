@@ -1,6 +1,6 @@
 services:
   bot:
-    build: .
+    image : .
     container_name: bot-saham
     env_file:
       - .env
