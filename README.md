@@ -1,4 +1,4 @@
-# Bot Saham WhatsApp (IDX) — AI + LinkedIn Auto Post
+# Bot Saham WhatsApp (IDX) — AI + LinkedIn Auto Post + MIS Logbook
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Flask](https://img.shields.io/badge/Flask-API-000000?logo=flask&logoColor=white)
@@ -10,7 +10,7 @@
 ## TL;DR
 - This project turns WhatsApp into a lightweight stock assistant for IDX quotes, market news summaries, and AI chat commands.
 - It is built for users who want fast market context and social posting workflows without switching between multiple tools.
-- It also supports a LinkedIn draft-to-publish flow (`!post` -> `!review` -> `!postok`) for quick content execution.
+- It supports a LinkedIn draft-to-publish flow (`!post` -> `!review` -> `!postok`) and MIS logbook submit flow (`!logbook` -> isi materi -> `!ok`).
 
 ## Live Demo (Visual)
 <p align="center">
@@ -37,6 +37,10 @@
 - `!review` -> review current LinkedIn draft before posting
 - `!postok` -> publish draft to LinkedIn
 - `!cancelpost` -> cancel current draft session
+- `!logbook` -> start MIS logbook mode
+- `!ok` -> submit current logbook draft to MIS
+- `!update` -> replace logbook activity/material text
+- `!cancel` -> cancel current logbook session
 
 ## Architecture
 ```mermaid
@@ -49,6 +53,8 @@ flowchart LR
     B --> G[Groq API]
     B --> S[Backend Savior API]
     B --> L[LinkedIn API]
+    B --> C[CAS Login PENS]
+    C --> M[Online MIS Logbook]
 
     B --> R[WAHA sendText]
     R --> U
@@ -60,6 +66,7 @@ Core components:
 - **Market Data**: TradingView (`tvDatafeed`) for IDX quote and IHSG
 - **Content + AI**: Google News RSS + Groq summary/chat + backend mentor mode
 - **Social Distribution**: LinkedIn image post pipeline (draft, review, publish)
+- **Campus Automation**: CAS-authenticated MIS logbook form submit
 
 ## End-to-End Flows
 ### Flow A — Stock / News Query
@@ -74,6 +81,72 @@ Core components:
 3. User sends `!review` to inspect draft readiness.
 4. User sends `!postok` to publish to LinkedIn (`!cancelpost` to abort).
 5. Bot confirms success/failure and closes draft session.
+
+### Flow C — MIS Logbook Submit
+1. User sends `!logbook` to activate logbook mode.
+2. User sends `Kegiatan/Materi` text manually.
+3. Bot sends draft summary (tanggal/jam/matkul default + materi).
+4. User sends `!ok` to submit (`!update` untuk ganti materi, `!cancel` untuk batal).
+5. Bot login ke CAS, submit logbook ke MIS via AJAX, lalu kirim hasilnya ke chat.
+
+#### Technical Detail — How MIS Submission Works
+
+The MIS logbook page (`mEntry_Logbook_KP1.php`) is a **JavaScript shell page** — its form body is empty in raw HTML and is populated entirely by a JavaScript AJAX call on page load:
+
+```html
+<body onload="showEntry_Logbook_KP1(2025, 2, 9)">
+<form id="kirim">
+  <div id="tdData"></div>  <!-- filled by JS -->
+</form>
+<script src="japascript/absen.js"></script>
+```
+
+Because the bot uses Python `requests` (no browser, no JS execution), it cannot rely on the shell page. Instead, it **replicates the JavaScript behavior manually**:
+
+**Step 1 — CAS Login**
+```
+GET  login.pens.ac.id/cas/login  →  parse form (hidden fields: lt, _eventId)
+POST CAS with username + password + hidden fields  →  get session cookie
+```
+
+**Step 2 — Fetch shell page, extract AJAX parameters**
+```
+GET  mEntry_Logbook_KP1.php
+Read onload="showEntry_Logbook_KP1(2025, 2, 9)"
+                              └tahun┘  └sem┘  └minggu┘
+```
+
+**Step 3 — Fetch the real form via AJAX URL**
+```
+GET  entry_logbook_kp1.php?valTahun=2025&valSemester=2&valMinggu=9
+Read hidden fields:
+  - kp_daftar  (KP registration ID)
+  - mahasiswa  (student DB ID)
+  - tanggal    (server-provided date: YYYY-MM-DD)
+  - matakuliah options (dropdown choices)
+  - valnrpMahasiswa (NRP from onclick button)
+```
+
+**Step 4 — POST submission (replicating `simpan_data_logbook1` JS function)**
+
+The Simpan button in browser calls:
+```js
+onclick="simpan_data_logbook1(2423600049, 2025, 2, 9)"
+// which does: POST entry_logbook_kp1.php with Simpan=1 + all field values
+```
+
+The bot replicates this exact POST:
+```
+POST  entry_logbook_kp1.php
+body: valnrpMahasiswa=2423600049 + valTahun=2025 + valSemester=2 + valMinggu=9
+    + Simpan=1 + tanggal=2026-03-03 + jam_mulai=08:00 + jam_selesai=17:00
+    + kegiatan=<materi> + sesuai_kuliah=1 + matakuliah=<id> 
+    + kp_daftar=7254 + mahasiswa=24190 + Setuju=1
+```
+
+> **Key insight**: Hidden fields (`kp_daftar`, `mahasiswa`, `tanggal`) are values pre-filled by the server and not visible to the user. The bot fetches these from the AJAX page HTML before submitting, so the server receives a complete and valid payload — identical to what a browser would send.
+
+
 
 ## Screenshots
 
@@ -132,6 +205,7 @@ python scripts/simulate_webhook.py --text '!post'
 python scripts/simulate_webhook.py --text 'Draft caption test' --media-url 'https://example.com/image.jpg' --media-mimetype 'image/jpeg'
 python scripts/simulate_webhook.py --text '!review'
 python scripts/simulate_webhook.py --text '!postok'
+python scripts/simulate_webhook.py --logbook-demo
 ```
 
 ## Environment Variables
@@ -187,6 +261,24 @@ python scripts/simulate_webhook.py --text '!postok'
 | `POST_SESSION_TTL_SECONDS` | `900` | Draft session TTL per chat |
 | `LINKEDIN_CAPTION_MAX_CHARS` | `3000` | Caption character limit |
 
+### MIS Logbook
+| Variable | Default | Description |
+|---|---|---|
+| `LOGBOOK_ENABLED` | `true` | Enable/disable `!logbook` flow |
+| `LOGBOOK_ALLOWED_CHAT_IDS` | - | Comma-separated allowed chat IDs (required) |
+| `LOGBOOK_CAS_LOGIN_URL` | CAS login URL + service MIS | CAS login endpoint |
+| `LOGBOOK_FORM_URL` | `https://online.mis.pens.ac.id/mEntry_Logbook_KP1.php` | Target logbook form page |
+| `LOGBOOK_CAS_USERNAME` | - | CAS username |
+| `LOGBOOK_CAS_PASSWORD` | - | CAS password |
+| `LOGBOOK_DEFAULT_START_TIME` | `08:00` | Default jam mulai |
+| `LOGBOOK_DEFAULT_END_TIME` | `17:00` | Default jam selesai |
+| `LOGBOOK_DEFAULT_RELATED` | `true` | Default radio "sesuai matkul" |
+| `LOGBOOK_DEFAULT_COURSE_KEYWORD` | `RI042106` | Keyword pencarian opsi matkul |
+| `LOGBOOK_DEFAULT_CHECKBOX` | `true` | Default checkbox pernyataan |
+| `LOGBOOK_TIMEOUT_CONNECT` | `10` | Connect timeout (seconds) |
+| `LOGBOOK_TIMEOUT_READ` | `45` | Read timeout (seconds) |
+| `LOGBOOK_MATERIAL_MAX_CHARS` | `4000` | Max karakter kegiatan/materi |
+
 ## Deployment (Private Server)
 Recommended workflow for your current setup (update on laptop, deploy on private server):
 
@@ -215,6 +307,12 @@ Notes:
   - Confirm webhook event type is `message` or `message.any` and session status is `WORKING`.
 - **Draft not found**:
   - Draft state is in-memory; restarting bot resets active draft sessions.
+- **`!logbook` ditolak dengan "tidak diizinkan"**:
+  - Pastikan `LOGBOOK_ALLOWED_CHAT_IDS` berisi `chatId` WA yang benar.
+- **Login CAS gagal saat `!ok`**:
+  - Verifikasi `LOGBOOK_CAS_USERNAME`, `LOGBOOK_CAS_PASSWORD`, dan `LOGBOOK_CAS_LOGIN_URL`.
+- **Matkul tidak ditemukan saat submit logbook**:
+  - Ubah `LOGBOOK_DEFAULT_COURSE_KEYWORD` agar match dengan value/teks opsi dropdown di MIS.
 
 ## Author
 **Syauqi Naufal**  

@@ -3,7 +3,7 @@ import math
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -13,6 +13,7 @@ from tvDatafeed import Interval, TvDatafeed
 
 from ai_router import get_ai_reply, get_backend_savior_reply, summarize_news
 from linkedin_client import create_linkedin_image_post
+from mis_logbook_client import LogbookConfig, LogbookEntry, submit_logbook_entry
 from news_client import fetch_news
 
 load_dotenv()
@@ -71,12 +72,34 @@ NEWS_MAX_ITEMS = max(3, min(10, env_int("NEWS_MAX_ITEMS", 5)))
 BACKEND_SAVIOR_DEBUG = env_bool("BACKEND_SAVIOR_DEBUG", True)
 POST_SESSION_TTL_SECONDS = env_int("POST_SESSION_TTL_SECONDS", 900)
 LINKEDIN_CAPTION_MAX_CHARS = env_int("LINKEDIN_CAPTION_MAX_CHARS", 3000)
+LOGBOOK_ENABLED = env_bool("LOGBOOK_ENABLED", True)
+LOGBOOK_ALLOWED_CHAT_IDS = {
+    item.strip()
+    for item in env_str("LOGBOOK_ALLOWED_CHAT_IDS", "").split(",")
+    if item.strip()
+}
+LOGBOOK_CAS_LOGIN_URL = env_str(
+    "LOGBOOK_CAS_LOGIN_URL",
+    "https://login.pens.ac.id/cas/login?service=https%3A%2F%2Fonline.mis.pens.ac.id%2Findex.php%3FLogin%3D1%26halAwal%3D1",
+)
+LOGBOOK_FORM_URL = env_str("LOGBOOK_FORM_URL", "https://online.mis.pens.ac.id/mEntry_Logbook_KP1.php")
+LOGBOOK_CAS_USERNAME = os.getenv("LOGBOOK_CAS_USERNAME", "")
+LOGBOOK_CAS_PASSWORD = os.getenv("LOGBOOK_CAS_PASSWORD", "")
+LOGBOOK_DEFAULT_START_TIME = env_str("LOGBOOK_DEFAULT_START_TIME", "08:00")
+LOGBOOK_DEFAULT_END_TIME = env_str("LOGBOOK_DEFAULT_END_TIME", "17:00")
+LOGBOOK_DEFAULT_RELATED = env_bool("LOGBOOK_DEFAULT_RELATED", True)
+LOGBOOK_DEFAULT_COURSE_KEYWORD = env_str("LOGBOOK_DEFAULT_COURSE_KEYWORD", "RI042106")
+LOGBOOK_DEFAULT_CHECKBOX = env_bool("LOGBOOK_DEFAULT_CHECKBOX", True)
+LOGBOOK_TIMEOUT_CONNECT = env_int("LOGBOOK_TIMEOUT_CONNECT", 10)
+LOGBOOK_TIMEOUT_READ = env_int("LOGBOOK_TIMEOUT_READ", 45)
+LOGBOOK_MATERIAL_MAX_CHARS = env_int("LOGBOOK_MATERIAL_MAX_CHARS", 4000)
 
 HTTP_TIMEOUT = 15
 
 cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 rate_limit: Dict[str, float] = {}
 post_drafts: Dict[str, Dict[str, Any]] = {}
+logbook_sessions: Dict[str, Dict[str, Any]] = {}
 
 INTERVAL_MAP = {
     "1m": Interval.in_1_minute,
@@ -90,6 +113,23 @@ tv_client: Optional[TvDatafeed] = None
 tv_client_error: Optional[str] = None
 
 http_session = requests.Session()
+
+if LOGBOOK_ENABLED:
+    if not LOGBOOK_ALLOWED_CHAT_IDS:
+        logger.warning("LOGBOOK_ENABLED=true tapi LOGBOOK_ALLOWED_CHAT_IDS masih kosong.")
+    if not LOGBOOK_CAS_LOGIN_URL:
+        logger.warning("LOGBOOK_CAS_LOGIN_URL belum di-set.")
+    if not LOGBOOK_FORM_URL:
+        logger.warning("LOGBOOK_FORM_URL belum di-set.")
+    if not re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", LOGBOOK_DEFAULT_START_TIME) or not re.match(
+        r"^(?:[01]\d|2[0-3]):[0-5]\d$",
+        LOGBOOK_DEFAULT_END_TIME,
+    ):
+        logger.warning(
+            "Format default jam logbook tidak valid. Start=%s End=%s",
+            LOGBOOK_DEFAULT_START_TIME,
+            LOGBOOK_DEFAULT_END_TIME,
+        )
 
 
 def get_tv_client() -> Optional[TvDatafeed]:
@@ -193,10 +233,18 @@ def parse_command(text: str) -> Tuple[Optional[str], Optional[str]]:
     if re.match(r"^!news\b", lower):
         query = re.sub(r"^!news\s*", "", cleaned, flags=re.IGNORECASE).strip()
         return "news", normalize_news_query(query)
+    if re.match(r"^!logbook\b", lower):
+        return "logbook", None
     if re.match(r"^!postok\b", lower):
         return "postok", None
     if re.match(r"^!cancelpost\b", lower):
         return "cancelpost", None
+    if re.match(r"^!ok\b", lower):
+        return "logbook_ok", None
+    if re.match(r"^!cancel\b", lower):
+        return "logbook_cancel", None
+    if re.match(r"^!update\b", lower):
+        return "logbook_update", None
     if re.match(r"^!review\b", lower):
         return "review", None
     if re.match(r"^!post\b", lower):
@@ -241,6 +289,230 @@ def extract_message(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[st
     from_me = bool(data.get("fromMe") or data.get("from_me"))
     media = extract_media(data)
     return text, chat_id, from_me, media
+
+
+def is_valid_time_hhmm(value: str) -> bool:
+    return bool(re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", str(value or "").strip()))
+
+
+def today_wib_date() -> str:
+    return (datetime.now(UTC) + timedelta(hours=7)).strftime("%d-%m-%Y")
+
+
+def build_logbook_config() -> LogbookConfig:
+    return LogbookConfig(
+        cas_login_url=LOGBOOK_CAS_LOGIN_URL,
+        form_url=LOGBOOK_FORM_URL,
+        username=LOGBOOK_CAS_USERNAME,
+        password=LOGBOOK_CAS_PASSWORD,
+        timeout_connect=LOGBOOK_TIMEOUT_CONNECT,
+        timeout_read=LOGBOOK_TIMEOUT_READ,
+    )
+
+
+def normalize_whatsapp_chat_id(chat_id: str) -> str:
+    raw = str(chat_id or "").strip().lower()
+    if not raw:
+        return ""
+    if "@" not in raw:
+        digits = re.sub(r"\D", "", raw)
+        return digits or raw
+
+    user_part, domain = raw.split("@", 1)
+    if domain in {"c.us", "s.whatsapp.net"}:
+        digits = re.sub(r"\D", "", user_part)
+        return digits or raw
+    return raw
+
+
+def is_logbook_chat_allowed(chat_id: str) -> bool:
+    if not LOGBOOK_ALLOWED_CHAT_IDS:
+        return False
+    normalized_target = normalize_whatsapp_chat_id(chat_id)
+    for allowed in LOGBOOK_ALLOWED_CHAT_IDS:
+        if normalize_whatsapp_chat_id(allowed) == normalized_target:
+            return True
+    return False
+
+
+def new_logbook_session() -> Dict[str, Any]:
+    return {
+        "status": "awaiting_material",
+        "date": today_wib_date(),
+        "start_time": LOGBOOK_DEFAULT_START_TIME,
+        "end_time": LOGBOOK_DEFAULT_END_TIME,
+        "related": LOGBOOK_DEFAULT_RELATED,
+        "course_keyword": LOGBOOK_DEFAULT_COURSE_KEYWORD,
+        "agree_checkbox": LOGBOOK_DEFAULT_CHECKBOX,
+        "material": "",
+    }
+
+
+def get_logbook_session(chat_id: str) -> Optional[Dict[str, Any]]:
+    session = logbook_sessions.get(chat_id)
+    if not session:
+        return None
+    updated_at = float(session.get("updated_at", 0.0))
+    if updated_at and time.time() - updated_at > POST_SESSION_TTL_SECONDS:
+        logbook_sessions.pop(chat_id, None)
+        return None
+    return session
+
+
+def save_logbook_session(chat_id: str, session: Dict[str, Any]) -> None:
+    now = time.time()
+    if "created_at" not in session:
+        session["created_at"] = now
+    session["updated_at"] = now
+    logbook_sessions[chat_id] = session
+
+
+def clear_logbook_session(chat_id: str) -> None:
+    logbook_sessions.pop(chat_id, None)
+
+
+def is_logbook_command(command: Optional[str]) -> bool:
+    return command in {"logbook", "logbook_ok", "logbook_cancel", "logbook_update"}
+
+
+def format_logbook_draft_review(session: Dict[str, Any]) -> str:
+    material = str(session.get("material") or "").strip()
+    lines = [
+        "Draft logbook KP:",
+        f"- Tanggal: {session.get('date')}",
+        f"- Jam: {session.get('start_time')} - {session.get('end_time')}",
+        f"- Sesuai matkul: {'Ya' if session.get('related') else 'Tidak'}",
+        f"- Matkul keyword: {session.get('course_keyword')}",
+        f"- Checkbox pernyataan: {'Ya' if session.get('agree_checkbox') else 'Tidak'}",
+        "",
+    ]
+    if material:
+        lines.extend(["Kegiatan/Materi:", material, ""])
+        lines.append("Ketik !ok untuk submit, !update untuk ganti materi, atau !cancel untuk batal.")
+    else:
+        lines.append("Kegiatan/Materi: (belum diisi)")
+        lines.append("Kirim isi kegiatan/materi sekarang.")
+    return "\n".join(lines)
+
+
+def handle_logbook_mode_input(chat_id: str, text: Optional[str]) -> bool:
+    session = get_logbook_session(chat_id)
+    if not session:
+        return False
+
+    material = (text or "").strip()
+    if not material:
+        send_text(chat_id, "Kegiatan/materi kosong. Kirim teks kegiatan dulu.")
+        return True
+    if len(material) > LOGBOOK_MATERIAL_MAX_CHARS:
+        send_text(chat_id, f"Kegiatan/materi terlalu panjang. Maksimal {LOGBOOK_MATERIAL_MAX_CHARS} karakter.")
+        return True
+
+    session["material"] = material
+    session["status"] = "awaiting_confirmation"
+    save_logbook_session(chat_id, session)
+    send_text(chat_id, format_logbook_draft_review(session))
+    return True
+
+
+def handle_logbook_command(chat_id: str, command: str) -> str:
+    if command == "logbook":
+        if get_post_draft(chat_id):
+            send_text(
+                chat_id,
+                "Mode !post masih aktif. Selesaikan dulu dengan !postok / !cancelpost sebelum pakai !logbook.",
+            )
+            return "post_mode_waiting"
+        if not LOGBOOK_ENABLED:
+            send_text(chat_id, "Fitur logbook sedang nonaktif.")
+            return "ok"
+        if not is_logbook_chat_allowed(chat_id):
+            logger.warning("Logbook access denied for chat_id=%s", chat_id)
+            send_text(chat_id, "Kamu tidak diizinkan memakai fitur logbook ini.")
+            return "ok"
+
+        session = get_logbook_session(chat_id)
+        if not session:
+            session = new_logbook_session()
+            save_logbook_session(chat_id, session)
+            logger.info("Logbook session started for chat_id=%s", chat_id)
+            send_text(
+                chat_id,
+                "\n".join(
+                    [
+                        "Mode !logbook aktif.",
+                        "Kirim teks kegiatan/materi harian kamu.",
+                        "Setelah ringkasan muncul: !ok untuk submit, !update untuk ganti materi, !cancel untuk batal.",
+                    ]
+                ),
+            )
+            return "ok"
+
+        send_text(chat_id, format_logbook_draft_review(session))
+        return "ok"
+
+    if command in {"logbook_ok", "logbook_cancel", "logbook_update"} and get_post_draft(chat_id):
+        send_text(
+            chat_id,
+            "Kamu sedang di mode !post. Gunakan !postok atau !cancelpost dulu.",
+        )
+        return "post_mode_waiting"
+
+    session = get_logbook_session(chat_id)
+    if not session:
+        send_text(chat_id, "Belum ada sesi !logbook aktif. Ketik !logbook untuk mulai.")
+        return "ok"
+
+    if command == "logbook_cancel":
+        clear_logbook_session(chat_id)
+        logger.info("Logbook session cancelled for chat_id=%s", chat_id)
+        send_text(chat_id, "Sesi logbook dibatalkan.")
+        return "ok"
+
+    if command == "logbook_update":
+        session["status"] = "awaiting_material"
+        save_logbook_session(chat_id, session)
+        send_text(chat_id, "Silakan kirim kegiatan/materi terbaru untuk mengganti draft.")
+        return "ok"
+
+    if command == "logbook_ok":
+        material = str(session.get("material") or "").strip()
+        if not material:
+            send_text(chat_id, "Draft belum ada kegiatan/materi. Kirim teks kegiatan dulu.")
+            return "ok"
+        if not is_valid_time_hhmm(str(session.get("start_time") or "")) or not is_valid_time_hhmm(
+            str(session.get("end_time") or "")
+        ):
+            send_text(chat_id, "Format jam default tidak valid. Periksa LOGBOOK_DEFAULT_START_TIME/END_TIME.")
+            return "error"
+
+        send_text(chat_id, "Sedang submit logbook ke MIS, tunggu sebentar...")
+        entry = LogbookEntry(
+            date=str(session.get("date") or today_wib_date()),
+            start_time=str(session.get("start_time") or LOGBOOK_DEFAULT_START_TIME),
+            end_time=str(session.get("end_time") or LOGBOOK_DEFAULT_END_TIME),
+            activity=material,
+            related=bool(session.get("related")),
+            course_keyword=str(session.get("course_keyword") or LOGBOOK_DEFAULT_COURSE_KEYWORD),
+            agree=bool(session.get("agree_checkbox")),
+        )
+        success, message = submit_logbook_entry(entry, build_logbook_config())
+        if success:
+            clear_logbook_session(chat_id)
+            logger.info("Logbook submitted successfully for chat_id=%s date=%s", chat_id, entry.date)
+            send_text(chat_id, message)
+            return "ok"
+
+        logger.warning("Logbook submit failed for chat_id=%s: %s", chat_id, message)
+        send_text(
+            chat_id,
+            "Gagal submit logbook: {message}\nKamu bisa !update untuk ganti materi, !ok untuk coba lagi, atau !cancel.".format(
+                message=message
+            ),
+        )
+        return "error"
+
+    return "ignored"
 
 
 def get_post_draft(chat_id: str) -> Optional[Dict[str, Any]]:
@@ -658,6 +930,8 @@ def help_text() -> str:
             "8) LinkedIn auto-post: !post",
             "9) Review draft LinkedIn: !review",
             "10) Publish draft LinkedIn: !postok / batal: !cancelpost",
+            "11) Mode logbook KP: !logbook",
+            "12) Submit/cancel/update logbook: !ok / !cancel / !update",
             "",
             "Catatan:",
             "- Data harga saham & IHSG via TradingView (tvDatafeed)",
@@ -665,6 +939,7 @@ def help_text() -> str:
             "- Output S/R berbasis pivot harian",
             "- AI chat umum via !ai, mentor backend via !explain, berita via !news",
             "- LinkedIn post support caption + 1 gambar",
+            "- Logbook mode: isi materi manual, lalu konfirmasi submit ke MIS",
         ]
     )
 
@@ -683,6 +958,25 @@ def webhook() -> Any:
         return jsonify({"status": "ignored"})
 
     command, symbol = parse_command(text) if text else (None, None)
+
+    if is_logbook_command(command):
+        ok, remaining = rate_limit_ok(chat_id)
+        if not ok:
+            send_text(chat_id, f"Mohon tunggu {remaining} detik sebelum request lagi.")
+            return jsonify({"status": "rate_limited"})
+        status = handle_logbook_command(chat_id, str(command))
+        return jsonify({"status": status})
+
+    if get_logbook_session(chat_id):
+        if command:
+            send_text(
+                chat_id,
+                "Kamu masih di mode !logbook. Kirim teks kegiatan/materi, atau pakai !ok / !update / !cancel.",
+            )
+            return jsonify({"status": "logbook_mode_waiting"})
+        if text and handle_logbook_mode_input(chat_id, text):
+            return jsonify({"status": "ok"})
+        return jsonify({"status": "logbook_mode_waiting"})
 
     if command in {"post", "postok", "cancelpost", "review"}:
         ok, remaining = rate_limit_ok(chat_id)
