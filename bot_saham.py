@@ -72,6 +72,7 @@ NEWS_MAX_ITEMS = max(3, min(10, env_int("NEWS_MAX_ITEMS", 5)))
 BACKEND_SAVIOR_DEBUG = env_bool("BACKEND_SAVIOR_DEBUG", True)
 POST_SESSION_TTL_SECONDS = env_int("POST_SESSION_TTL_SECONDS", 900)
 LINKEDIN_CAPTION_MAX_CHARS = env_int("LINKEDIN_CAPTION_MAX_CHARS", 3000)
+LINKEDIN_MAX_IMAGES = max(1, min(3, env_int("LINKEDIN_MAX_IMAGES", 3)))
 LOGBOOK_ENABLED = env_bool("LOGBOOK_ENABLED", True)
 LOGBOOK_ALLOWED_CHAT_IDS = {
     item.strip()
@@ -523,7 +524,7 @@ def get_post_draft(chat_id: str) -> Optional[Dict[str, Any]]:
     if time.time() - updated_at > POST_SESSION_TTL_SECONDS:
         post_drafts.pop(chat_id, None)
         return None
-    return draft
+    return ensure_post_images_schema(draft)
 
 
 def save_post_draft(chat_id: str, draft: Dict[str, Any]) -> None:
@@ -538,9 +539,39 @@ def clear_post_draft(chat_id: str) -> None:
     post_drafts.pop(chat_id, None)
 
 
+def ensure_post_images_schema(draft: Dict[str, Any]) -> Dict[str, Any]:
+    images: List[Dict[str, Optional[str]]] = []
+    existing = draft.get("images")
+    if isinstance(existing, list):
+        for item in existing:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip() or None
+            data = str(item.get("data") or "").strip() or None
+            mimetype = str(item.get("mimetype") or "").strip() or "image/jpeg"
+            if not url and not data:
+                continue
+            images.append({"url": url, "data": data, "mimetype": mimetype})
+
+    legacy_url = str(draft.get("image_url") or "").strip() or None
+    legacy_data = str(draft.get("image_data") or "").strip() or None
+    legacy_mimetype = str(draft.get("image_mimetype") or "").strip() or "image/jpeg"
+    if (legacy_url or legacy_data) and len(images) < LINKEDIN_MAX_IMAGES:
+        duplicated = any(item.get("url") == legacy_url and item.get("data") == legacy_data for item in images)
+        if not duplicated:
+            images.append({"url": legacy_url, "data": legacy_data, "mimetype": legacy_mimetype})
+
+    draft["images"] = images[:LINKEDIN_MAX_IMAGES]
+    draft.pop("image_url", None)
+    draft.pop("image_data", None)
+    draft.pop("image_mimetype", None)
+    return draft
+
+
 def missing_post_fields(draft: Dict[str, Any]) -> List[str]:
     missing: List[str] = []
-    if not draft.get("image_url") and not draft.get("image_data"):
+    images = draft.get("images") or []
+    if not isinstance(images, list) or len(images) == 0:
         missing.append("gambar")
     if not draft.get("caption"):
         missing.append("caption")
@@ -550,16 +581,19 @@ def missing_post_fields(draft: Dict[str, Any]) -> List[str]:
 def build_post_draft_progress_text(draft: Dict[str, Any], updated_parts: List[str]) -> str:
     updated = ", ".join(updated_parts)
     missing = missing_post_fields(draft)
+    image_count = len(list(draft.get("images") or []))
     if missing:
         needed = ", ".join(missing)
         return (
             f"Draft LinkedIn diupdate ({updated}).\n"
+            f"Gambar tersimpan: {image_count}/{LINKEDIN_MAX_IMAGES}.\n"
             f"Yang masih kurang: {needed}.\n"
             "Kirim datanya sekarang. Kalau sudah lengkap, ketik !postok."
         )
     return (
         f"Draft LinkedIn diupdate ({updated}).\n"
-        "Caption + gambar sudah lengkap. Ketik !review untuk cek draft, !postok untuk publish, atau !cancelpost buat batal."
+        f"Caption + gambar sudah lengkap ({image_count}/{LINKEDIN_MAX_IMAGES}). "
+        "Ketik !review untuk cek draft, !postok untuk publish, atau !cancelpost buat batal."
     )
 
 
@@ -577,6 +611,7 @@ def handle_post_mode_input(chat_id: str, text: Optional[str], media: Optional[Di
         return False
 
     updated_parts: List[str] = []
+    warnings: List[str] = []
     if media:
         if not is_image_media(media):
             send_text(chat_id, "Mode !post hanya menerima file gambar (image/*).")
@@ -586,10 +621,22 @@ def handle_post_mode_input(chat_id: str, text: Optional[str], media: Optional[Di
         if not image_url and not image_data:
             send_text(chat_id, "Gambar terdeteksi, tapi URL/data media kosong. Coba kirim ulang gambarnya.")
             return True
-        draft["image_url"] = image_url
-        draft["image_data"] = image_data
-        draft["image_mimetype"] = media.get("mimetype") or "image/jpeg"
-        updated_parts.append("gambar")
+        images = list(draft.get("images") or [])
+        if len(images) >= LINKEDIN_MAX_IMAGES:
+            warnings.append(
+                f"Maksimal {LINKEDIN_MAX_IMAGES} gambar per post. "
+                "Lanjut !review / !postok atau reset draft dengan !cancelpost."
+            )
+        else:
+            images.append(
+                {
+                    "url": image_url,
+                    "data": image_data,
+                    "mimetype": media.get("mimetype") or "image/jpeg",
+                }
+            )
+            draft["images"] = images
+            updated_parts.append(f"gambar ({len(images)}/{LINKEDIN_MAX_IMAGES})")
 
     caption = (text or "").strip()
     if caption:
@@ -600,24 +647,32 @@ def handle_post_mode_input(chat_id: str, text: Optional[str], media: Optional[Di
         updated_parts.append("caption")
 
     if not updated_parts:
+        if warnings:
+            send_text(chat_id, "\n".join(warnings))
+            return True
         send_text(chat_id, "Kirim gambar atau caption dulu. Pakai !cancelpost kalau mau batal.")
         return True
 
     save_post_draft(chat_id, draft)
-    send_text(chat_id, build_post_draft_progress_text(draft, updated_parts))
+    progress_text = build_post_draft_progress_text(draft, updated_parts)
+    if warnings:
+        progress_text = "\n".join(warnings) + "\n\n" + progress_text
+    send_text(chat_id, progress_text)
     return True
 
 
 def format_post_draft_review(draft: Dict[str, Any]) -> str:
     caption = str(draft.get("caption") or "").strip()
-    has_image = bool(draft.get("image_url") or draft.get("image_data"))
+    images = list(draft.get("images") or [])
+    image_count = len(images)
     missing = missing_post_fields(draft)
     lines = [
         "Draft post LinkedIn:",
-        f"- Gambar: {'siap' if has_image else 'belum ada'}",
+        f"- Gambar: {image_count}/{LINKEDIN_MAX_IMAGES}",
     ]
-    if draft.get("image_url"):
-        lines.append(f"- URL gambar: {draft['image_url']}")
+    for index, item in enumerate(images, start=1):
+        source_type = "base64" if item.get("data") else "url"
+        lines.append(f"  - Gambar #{index}: siap ({source_type})")
     if caption:
         lines.extend(["", "Caption:", caption])
     else:
@@ -638,9 +693,7 @@ def handle_post_command(chat_id: str, command: str) -> str:
             chat_id,
             {
                 "caption": "",
-                "image_url": None,
-                "image_data": None,
-                "image_mimetype": None,
+                "images": [],
             },
         )
         send_text(
@@ -648,8 +701,8 @@ def handle_post_command(chat_id: str, command: str) -> str:
             "\n".join(
                 [
                     "Mode post LinkedIn aktif.",
-                    "Kirim gambar + caption untuk draft post.",
-                    "- Boleh kirim gambar dulu, caption belakangan (atau sebaliknya).",
+                    f"Kirim max {LINKEDIN_MAX_IMAGES} gambar + caption untuk draft post.",
+                    "- Boleh kirim gambar bertahap, caption belakangan (atau sebaliknya).",
                     "- Review draft: !review",
                     "- Publish: !postok",
                     "- Batal: !cancelpost",
@@ -685,9 +738,7 @@ def handle_post_command(chat_id: str, command: str) -> str:
         send_text(chat_id, "Sedang publish ke LinkedIn, tunggu sebentar...")
         post_id, error = create_linkedin_image_post(
             caption=str(draft.get("caption", "")).strip(),
-            media_url=str(draft.get("image_url") or "").strip() or None,
-            media_data_base64=str(draft.get("image_data") or "").strip() or None,
-            media_mimetype=str(draft.get("image_mimetype") or "").strip() or None,
+            media_items=list(draft.get("images") or []),
             waha_api_key=WAHA_API_KEY or None,
             waha_base_url=WAHA_BASE_URL or None,
         )
@@ -938,7 +989,7 @@ def help_text() -> str:
             "- Berita dari Google News RSS",
             "- Output S/R berbasis pivot harian",
             "- AI chat umum via !ai, mentor backend via !explain, berita via !news",
-            "- LinkedIn post support caption + 1 gambar",
+            f"- LinkedIn post support caption + 1-{LINKEDIN_MAX_IMAGES} gambar",
             "- Logbook mode: isi materi manual, lalu konfirmasi submit ke MIS",
         ]
     )

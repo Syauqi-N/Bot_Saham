@@ -33,7 +33,7 @@
 - `!news <topic>` -> latest news aggregation + AI summary
 - `!ai <text>` -> general AI chat response
 - `!explain <text>` -> backend mentor assistant mode
-- `!post` -> start LinkedIn draft mode
+- `!post` -> start LinkedIn draft mode (caption + up to 3 images)
 - `!review` -> review current LinkedIn draft before posting
 - `!postok` -> publish draft to LinkedIn
 - `!cancelpost` -> cancel current draft session
@@ -77,7 +77,7 @@ Core components:
 
 ### Flow B — LinkedIn Draft Posting
 1. User sends `!post` to activate draft mode.
-2. User sends image and caption (single or separate messages).
+2. User sends up to 3 images and caption (single or separate messages).
 3. User sends `!review` to inspect draft readiness.
 4. User sends `!postok` to publish to LinkedIn (`!cancelpost` to abort).
 5. Bot confirms success/failure and closes draft session.
@@ -260,6 +260,7 @@ python scripts/simulate_webhook.py --logbook-demo
 | `LINKEDIN_TIMEOUT_READ` | `45` | Read timeout (seconds) |
 | `POST_SESSION_TTL_SECONDS` | `900` | Draft session TTL per chat |
 | `LINKEDIN_CAPTION_MAX_CHARS` | `3000` | Caption character limit |
+| `LINKEDIN_MAX_IMAGES` | `3` | Maximum images per LinkedIn draft/post (1-3) |
 
 ### MIS Logbook
 | Variable | Default | Description |

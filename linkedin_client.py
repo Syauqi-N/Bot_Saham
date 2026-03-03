@@ -1,6 +1,6 @@
 import base64
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
@@ -21,6 +21,7 @@ LINKEDIN_AUTHOR_URN = os.getenv("LINKEDIN_AUTHOR_URN", "")
 LINKEDIN_API_BASE_URL = os.getenv("LINKEDIN_API_BASE_URL", "https://api.linkedin.com").rstrip("/")
 LINKEDIN_TIMEOUT_CONNECT = _env_int("LINKEDIN_TIMEOUT_CONNECT", 10)
 LINKEDIN_TIMEOUT_READ = _env_int("LINKEDIN_TIMEOUT_READ", 45)
+LINKEDIN_MAX_IMAGES = max(1, min(3, _env_int("LINKEDIN_MAX_IMAGES", 3)))
 
 _session = requests.Session()
 
@@ -202,7 +203,17 @@ def _decode_media_base64(media_data: str) -> Tuple[Optional[bytes], Optional[str
         return None, f"Gagal decode media base64: {exc}"
 
 
-def _create_ugc_image_post(caption: str, asset: str) -> Tuple[Optional[str], Optional[str]]:
+def _create_ugc_image_post(caption: str, assets: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    if not assets:
+        return None, "Asset LinkedIn kosong."
+    media_payload = [
+        {
+            "status": "READY",
+            "media": asset,
+            "title": {"text": f"Auto post image {index}"},
+        }
+        for index, asset in enumerate(assets, start=1)
+    ]
     payload: Dict[str, Any] = {
         "author": LINKEDIN_AUTHOR_URN,
         "lifecycleState": "PUBLISHED",
@@ -210,13 +221,7 @@ def _create_ugc_image_post(caption: str, asset: str) -> Tuple[Optional[str], Opt
             "com.linkedin.ugc.ShareContent": {
                 "shareCommentary": {"text": caption},
                 "shareMediaCategory": "IMAGE",
-                "media": [
-                    {
-                        "status": "READY",
-                        "media": asset,
-                        "title": {"text": "Auto post"},
-                    }
-                ],
+                "media": media_payload,
             }
         },
         "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
@@ -246,6 +251,7 @@ def _create_ugc_image_post(caption: str, asset: str) -> Tuple[Optional[str], Opt
 
 def create_linkedin_image_post(
     caption: str,
+    media_items: Optional[List[Dict[str, Any]]] = None,
     media_url: Optional[str] = None,
     media_data_base64: Optional[str] = None,
     media_mimetype: Optional[str] = None,
@@ -258,36 +264,73 @@ def create_linkedin_image_post(
         return None, "LINKEDIN_AUTHOR_URN belum di-set."
     if not caption.strip():
         return None, "Caption kosong."
-    if not media_url and not media_data_base64:
-        return None, "Media image belum tersedia."
+    normalized_items: List[Dict[str, str]] = []
+    if isinstance(media_items, list):
+        for item in media_items:
+            if not isinstance(item, dict):
+                continue
+            item_url = str(item.get("url") or "").strip()
+            item_data = str(item.get("data") or "").strip()
+            if not item_url and not item_data:
+                continue
+            item_mimetype = str(item.get("mimetype") or "").strip() or "image/jpeg"
+            normalized_items.append(
+                {
+                    "url": item_url,
+                    "data": item_data,
+                    "mimetype": item_mimetype,
+                }
+            )
 
-    media_bytes: Optional[bytes] = None
-    resolved_mimetype = (media_mimetype or "").strip() or "image/jpeg"
-
-    if media_data_base64:
-        media_bytes, decode_error = _decode_media_base64(media_data_base64)
-        if decode_error:
-            return None, decode_error
-    elif media_url:
-        media_bytes, detected_mime, download_error = _download_media_from_url(
-            media_url,
-            waha_api_key,
-            waha_base_url,
+    if not normalized_items and (media_url or media_data_base64):
+        normalized_items.append(
+            {
+                "url": str(media_url or "").strip(),
+                "data": str(media_data_base64 or "").strip(),
+                "mimetype": str(media_mimetype or "").strip() or "image/jpeg",
+            }
         )
-        if download_error:
-            return None, download_error
-        if detected_mime:
-            resolved_mimetype = detected_mime
 
-    if not media_bytes:
-        return None, "Konten media kosong."
+    if not normalized_items:
+        return None, "Media image belum tersedia."
+    if len(normalized_items) > LINKEDIN_MAX_IMAGES:
+        return None, f"Maksimal {LINKEDIN_MAX_IMAGES} gambar per post."
 
-    upload_url, asset, register_error = _register_upload()
-    if register_error or not upload_url or not asset:
-        return None, register_error or "Gagal register upload ke LinkedIn."
+    assets: List[str] = []
+    for index, item in enumerate(normalized_items, start=1):
+        media_bytes: Optional[bytes] = None
+        resolved_mimetype = str(item.get("mimetype") or "").strip() or "image/jpeg"
+        item_data = str(item.get("data") or "").strip()
+        item_url = str(item.get("url") or "").strip()
 
-    upload_error = _upload_binary(upload_url, media_bytes, resolved_mimetype)
-    if upload_error:
-        return None, upload_error
+        if item_data:
+            media_bytes, decode_error = _decode_media_base64(item_data)
+            if decode_error:
+                return None, f"Gambar #{index}: {decode_error}"
+        elif item_url:
+            media_bytes, detected_mime, download_error = _download_media_from_url(
+                item_url,
+                waha_api_key,
+                waha_base_url,
+            )
+            if download_error:
+                return None, f"Gambar #{index}: {download_error}"
+            if detected_mime:
+                resolved_mimetype = detected_mime
+        else:
+            return None, f"Gambar #{index}: media URL/data kosong."
 
-    return _create_ugc_image_post(caption.strip(), asset)
+        if not media_bytes:
+            return None, f"Gambar #{index}: konten media kosong."
+
+        upload_url, asset, register_error = _register_upload()
+        if register_error or not upload_url or not asset:
+            return None, f"Gambar #{index}: {register_error or 'Gagal register upload ke LinkedIn.'}"
+
+        upload_error = _upload_binary(upload_url, media_bytes, resolved_mimetype)
+        if upload_error:
+            return None, f"Gambar #{index}: {upload_error}"
+
+        assets.append(asset)
+
+    return _create_ugc_image_post(caption.strip(), assets)
