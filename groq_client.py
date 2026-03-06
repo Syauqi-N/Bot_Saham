@@ -10,15 +10,20 @@ GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/co
 _session = requests.Session()
 
 
-def groq_chat(messages: List[Dict[str, str]], model: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+def groq_chat(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    max_tokens: int = 250,
+    temperature: float = 0.7,
+) -> Tuple[Optional[str], Optional[str]]:
     if not GROQ_API_KEY:
         return None, "GROQ_API_KEY belum di-set. AI chat belum aktif."
 
     payload: Dict[str, Any] = {
         "model": model or GROQ_MODEL,
         "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 250,
+        "temperature": temperature,
+        "max_tokens": max(1, max_tokens),
     }
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",

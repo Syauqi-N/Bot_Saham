@@ -1,4 +1,6 @@
 from pathlib import Path
+import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -9,6 +11,30 @@ MAX_HISTORY = 30
 _history: Dict[str, List[Dict[str, str]]] = {}
 BACKEND_SAVIOR_MAX_HISTORY = 20
 _backend_savior_history: Dict[str, List[Dict[str, str]]] = {}
+BACKEND_SAVIOR_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+logger = logging.getLogger("bot_saham.ai_router")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+BACKEND_SAVIOR_FALLBACK_TO_GROQ = _env_bool("BACKEND_SAVIOR_FALLBACK_TO_GROQ", True)
+BACKEND_SAVIOR_FALLBACK_MAX_TOKENS = max(100, _env_int("BACKEND_SAVIOR_FALLBACK_MAX_TOKENS", 450))
 
 
 def _load_system_prompt() -> str:
@@ -27,6 +53,20 @@ Aturan jawaban:
 3. Boilerplate: berikan contoh kode clean (Python atau Node.js) sesuai konteks user.
 4. Tutup dengan dorongan positif singkat.
 """.strip()
+
+
+def _is_retryable_backend_savior_error(error: str) -> bool:
+    lowered = error.lower()
+    if "timeout" in lowered:
+        return True
+    if "connection" in lowered or "temporarily unavailable" in lowered:
+        return True
+
+    status_match = re.search(r"backend savior error (\d{3})", lowered)
+    if not status_match:
+        return False
+    status_code = int(status_match.group(1))
+    return status_code in BACKEND_SAVIOR_RETRYABLE_STATUS_CODES
 
 
 def get_ai_reply(chat_id: str, user_text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -108,7 +148,26 @@ def get_backend_savior_reply(chat_id: str, user_text: str) -> Tuple[Optional[str
 
     reply, error = backend_savior_chat(messages)
     if error:
-        return None, error
+        can_fallback = (
+            BACKEND_SAVIOR_FALLBACK_TO_GROQ
+            and "BACKEND_SAVIOR_API_KEY" not in error
+            and _is_retryable_backend_savior_error(error)
+        )
+        if not can_fallback:
+            return None, error
+
+        fallback_reply, fallback_error = groq_chat(
+            messages,
+            max_tokens=BACKEND_SAVIOR_FALLBACK_MAX_TOKENS,
+        )
+        if fallback_error or not fallback_reply:
+            if fallback_error:
+                logger.warning("Backend Savior failed and fallback Groq failed: %s | %s", error, fallback_error)
+                return None, f"{error} | Fallback Groq gagal: {fallback_error}"
+            return None, error
+
+        logger.warning("Backend Savior failed, fallback to Groq used: %s", error)
+        reply = fallback_reply
 
     reply = (reply or "").strip()
     if not reply:

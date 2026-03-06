@@ -118,13 +118,27 @@ class LogbookFlowTests(unittest.TestCase):
         status = bot_saham.handle_logbook_command(self.chat_id, "logbook")
         self.assertEqual(status, "post_mode_waiting")
 
-    def test_ok_submits_and_clears_session(self) -> None:
+    def test_ok_submits_and_enters_awaiting_file(self) -> None:
         bot_saham.handle_logbook_command(self.chat_id, "logbook")
         bot_saham.handle_logbook_mode_input(self.chat_id, "Menyusun unit test dan dokumentasi.")
         status = bot_saham.handle_logbook_command(self.chat_id, "logbook_ok")
         self.assertEqual(status, "ok")
         self.assertEqual(self.mock_submit.call_count, 1)
+        # Session stays alive in awaiting_file state for optional file upload
+        session = bot_saham.get_logbook_session(self.chat_id)
+        self.assertIsNotNone(session)
+        self.assertEqual(session.get("status"), "awaiting_file")
+
+    def test_skip_after_ok_clears_session(self) -> None:
+        bot_saham.handle_logbook_command(self.chat_id, "logbook")
+        bot_saham.handle_logbook_mode_input(self.chat_id, "Menyusun unit test dan dokumentasi.")
+        bot_saham.handle_logbook_command(self.chat_id, "logbook_ok")
+        # !skip should clear the session
+        status = bot_saham.handle_logbook_command(self.chat_id, "logbook_skip")
+        self.assertEqual(status, "ok")
         self.assertIsNone(bot_saham.get_logbook_session(self.chat_id))
+
+
 
     def test_logbook_mode_blocks_other_command_in_webhook(self) -> None:
         bot_saham.handle_logbook_command(self.chat_id, "logbook")

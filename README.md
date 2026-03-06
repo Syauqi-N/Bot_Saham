@@ -30,7 +30,7 @@
 ## Key Features
 - `$KODE` (example: `$BBCA`) -> IDX quote + support/resistance snapshot
 - `!ihsg` -> IHSG index check
-- `!news <topic>` -> latest news aggregation + AI summary
+- `!news <topic>` -> latest news aggregation (multi-source) + AI summary
 - `!ai <text>` -> general AI chat response
 - `!explain <text>` -> backend mentor assistant mode
 - `!post` -> start LinkedIn draft mode (caption + up to 3 images)
@@ -49,7 +49,7 @@ flowchart LR
     W --> B[Flask Bot: bot_saham.py]
 
     B --> T[TradingView via tvDatafeed]
-    B --> N[Google News RSS]
+    B --> N[Google News + RSS Feeds]
     B --> G[Groq API]
     B --> S[Backend Savior API]
     B --> L[LinkedIn API]
@@ -224,6 +224,11 @@ python scripts/simulate_webhook.py --logbook-demo
 | `CACHE_TTL_SECONDS` | `60` | Cache TTL |
 | `RATE_LIMIT_SECONDS` | `5` | Per-chat rate-limit window |
 | `NEWS_MAX_ITEMS` | `5` | Max news items per query |
+| `NEWS_HTTP_TIMEOUT` | `8` | HTTP timeout per news source request (seconds) |
+| `NEWS_RELAX_DAYS` | `7` | Fallback day range when strict 1-day search is empty |
+| `NEWS_PER_SOURCE_MULTIPLIER` | `3` | Fetch multiplier per source before dedupe/filter |
+| `NEWS_SITE_SOURCES` | `cnbcindonesia.com,kontan.co.id,bisnis.com,idxchannel.com` | Domain list for Google site search |
+| `NEWS_DIRECT_FEEDS` | `https://www.antaranews.com/rss/ekonomi.xml` | Extra direct RSS feeds (comma-separated, supports `{query}` placeholder) |
 
 ### Market Data (TradingView)
 | Variable | Default | Description |
@@ -249,6 +254,8 @@ python scripts/simulate_webhook.py --logbook-demo
 | `BACKEND_SAVIOR_TIMEOUT_READ` | `45` | Read timeout (seconds) |
 | `BACKEND_SAVIOR_RETRIES` | `2` | Retry count |
 | `BACKEND_SAVIOR_RETRY_BACKOFF_SECONDS` | `1.2` | Exponential backoff base |
+| `BACKEND_SAVIOR_FALLBACK_TO_GROQ` | `true` | Use Groq fallback for retryable Backend Savior failures (`timeout`, `5xx`, `429`) |
+| `BACKEND_SAVIOR_FALLBACK_MAX_TOKENS` | `450` | Max output tokens for Groq fallback |
 
 ### LinkedIn Posting
 | Variable | Default | Description |

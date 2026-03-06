@@ -13,7 +13,7 @@ from tvDatafeed import Interval, TvDatafeed
 
 from ai_router import get_ai_reply, get_backend_savior_reply, summarize_news
 from linkedin_client import create_linkedin_image_post
-from mis_logbook_client import LogbookConfig, LogbookEntry, submit_logbook_entry
+from mis_logbook_client import LogbookConfig, LogbookEntry, LogbookFileType, submit_logbook_entry, upload_logbook_file
 from news_client import fetch_news
 
 load_dotenv()
@@ -246,6 +246,8 @@ def parse_command(text: str) -> Tuple[Optional[str], Optional[str]]:
         return "logbook_cancel", None
     if re.match(r"^!update\b", lower):
         return "logbook_update", None
+    if re.match(r"^!skip\b", lower) or re.match(r"^!lewati\b", lower):
+        return "logbook_skip", None
     if re.match(r"^!review\b", lower):
         return "review", None
     if re.match(r"^!post\b", lower):
@@ -373,7 +375,7 @@ def clear_logbook_session(chat_id: str) -> None:
 
 
 def is_logbook_command(command: Optional[str]) -> bool:
-    return command in {"logbook", "logbook_ok", "logbook_cancel", "logbook_update"}
+    return command in {"logbook", "logbook_ok", "logbook_cancel", "logbook_update", "logbook_skip"}
 
 
 def format_logbook_draft_review(session: Dict[str, Any]) -> str:
@@ -499,9 +501,23 @@ def handle_logbook_command(chat_id: str, command: str) -> str:
         )
         success, message = submit_logbook_entry(entry, build_logbook_config())
         if success:
-            clear_logbook_session(chat_id)
             logger.info("Logbook submitted successfully for chat_id=%s date=%s", chat_id, entry.date)
-            send_text(chat_id, message)
+            # Keep session in awaiting_file state for optional file upload
+            session["status"] = "awaiting_file"
+            session["pdf_uploaded"] = False
+            session["photo_uploaded"] = False
+            save_logbook_session(chat_id, session)
+            send_text(
+                chat_id,
+                "\n".join([
+                    message,
+                    "",
+                    "📎 Unggah file opsional:",
+                    "- Kirim file PDF (laporan progres, maks 1 MB)",
+                    "- Kirim foto JPG/JPEG (foto kegiatan, maks 500 KB)",
+                    "- Ketik !skip untuk lewati",
+                ]),
+            )
             return "ok"
 
         logger.warning("Logbook submit failed for chat_id=%s: %s", chat_id, message)
@@ -513,7 +529,101 @@ def handle_logbook_command(chat_id: str, command: str) -> str:
         )
         return "error"
 
+    if command == "logbook_skip":
+        clear_logbook_session(chat_id)
+        send_text(chat_id, "Sesi logbook selesai. File tidak diunggah.")
+        return "ok"
+
     return "ignored"
+
+
+def is_pdf_media(media: Dict[str, Any]) -> bool:
+    mimetype = str(media.get("mimetype") or "").lower()
+    if mimetype:
+        return mimetype in ("application/pdf", "application/x-pdf")
+    url = str(media.get("url") or "").lower()
+    fn = str(media.get("filename") or "").lower()
+    return url.endswith(".pdf") or fn.endswith(".pdf")
+
+
+def is_jpeg_media(media: Dict[str, Any]) -> bool:
+    mimetype = str(media.get("mimetype") or "").lower()
+    if mimetype:
+        return mimetype in ("image/jpeg", "image/jpg")
+    url = str(media.get("url") or "").lower()
+    fn = str(media.get("filename") or "").lower()
+    return any((url.endswith(e) or fn.endswith(e)) for e in (".jpg", ".jpeg"))
+
+
+def handle_logbook_file_upload(chat_id: str, media: Dict[str, Any]) -> bool:
+    """Handle a media message while session is in awaiting_file state."""
+    session = get_logbook_session(chat_id)
+    if not session or session.get("status") != "awaiting_file":
+        return False
+
+    if is_pdf_media(media):
+        file_type = LogbookFileType.PDF
+        fn = media.get("filename") or "laporan.pdf"
+        if not str(fn).lower().endswith(".pdf"):
+            fn = "laporan.pdf"
+    elif is_jpeg_media(media):
+        file_type = LogbookFileType.PHOTO
+        fn = media.get("filename") or "foto.jpg"
+        if not any(str(fn).lower().endswith(e) for e in (".jpg", ".jpeg")):
+            fn = "foto.jpg"
+    else:
+        send_text(
+            chat_id,
+            "Format tidak didukung. Kirim PDF (laporan) atau JPG/JPEG (foto kegiatan), atau ketik !skip.",
+        )
+        return True
+
+    media_url = media.get("url")
+    if not media_url:
+        send_text(chat_id, "URL file tidak tersedia. Coba kirim ulang atau ketik !skip.")
+        return True
+
+    send_text(chat_id, "Sedang mengunggah file ke MIS, tunggu sebentar...")
+    file_bytes = download_waha_media(str(media_url))
+    if not file_bytes:
+        send_text(chat_id, "Gagal mengunduh file dari WhatsApp. Coba kirim ulang atau ketik !skip.")
+        return True
+
+    ok, msg = upload_logbook_file(
+        file_bytes=file_bytes,
+        filename=str(fn),
+        file_type=file_type,
+        config=build_logbook_config(),
+    )
+    logger.info(
+        "Logbook file upload chat_id=%s type=%s ok=%s msg=%s", chat_id, file_type, ok, msg
+    )
+
+    if file_type == LogbookFileType.PDF:
+        session["pdf_uploaded"] = ok
+    else:
+        session["photo_uploaded"] = ok
+
+    pdf_done = session.get("pdf_uploaded", False)
+    photo_done = session.get("photo_uploaded", False)
+
+    reply_lines = [msg]
+    if ok:
+        if not pdf_done:
+            reply_lines.append("\nMasih bisa kirim file PDF laporan, atau ketik !skip untuk selesai.")
+        elif not photo_done:
+            reply_lines.append("\nMasih bisa kirim foto JPG kegiatan, atau ketik !skip untuk selesai.")
+        else:
+            reply_lines.append("\nSemua file terunggah. Sesi logbook selesai.")
+            clear_logbook_session(chat_id)
+            send_text(chat_id, "\n".join(reply_lines))
+            return True
+    else:
+        reply_lines.append("\nKirim ulang file yang benar, atau ketik !skip untuk lewati.")
+
+    save_logbook_session(chat_id, session)
+    send_text(chat_id, "\n".join(reply_lines))
+    return True
 
 
 def get_post_draft(chat_id: str) -> Optional[Dict[str, Any]]:
@@ -797,6 +907,24 @@ def send_text(chat_id: str, text: str) -> None:
         logger.exception("WAHA sendText error: %s", exc)
 
 
+def download_waha_media(url: str) -> Optional[bytes]:
+    """Download media bytes from a WAHA media URL."""
+    if not url:
+        return None
+    headers: Dict[str, str] = {}
+    if WAHA_API_KEY:
+        headers["X-API-Key"] = WAHA_API_KEY
+        headers["Authorization"] = f"Bearer {WAHA_API_KEY}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        if resp.status_code == 200:
+            return resp.content
+        logger.error("download_waha_media failed: %s %s", resp.status_code, url)
+    except requests.exceptions.RequestException as exc:
+        logger.error("download_waha_media error: %s", exc)
+    return None
+
+
 def sanitize_debug_error(error: Optional[str], limit: int = 300) -> str:
     if not error:
         return "Tidak ada detail error."
@@ -1019,15 +1147,41 @@ def webhook() -> Any:
         return jsonify({"status": status})
 
     if get_logbook_session(chat_id):
-        if command:
+        session = get_logbook_session(chat_id)
+
+        # --- State: awaiting_file (after successful logbook submit) ---
+        if session and session.get("status") == "awaiting_file":
+            if media and handle_logbook_file_upload(chat_id, media):
+                return jsonify({"status": "ok"})
+            if command == "logbook_skip":
+                # already handled above via is_logbook_command, but guard here too
+                pass
+            if not media and not command:
+                send_text(
+                    chat_id,
+                    "Kirim file PDF (laporan) atau foto JPG/JPEG (foto kegiatan), atau ketik !skip untuk selesai.",
+                )
+                return jsonify({"status": "logbook_file_waiting"})
+            if command and command != "logbook_skip":
+                send_text(
+                    chat_id,
+                    "Kamu masih di mode unggah file logbook. Kirim file atau ketik !skip untuk selesai.",
+                )
+                return jsonify({"status": "logbook_file_waiting"})
+
+        # --- State: awaiting_material / awaiting_confirmation ---
+        elif command:
             send_text(
                 chat_id,
                 "Kamu masih di mode !logbook. Kirim teks kegiatan/materi, atau pakai !ok / !update / !cancel.",
             )
             return jsonify({"status": "logbook_mode_waiting"})
-        if text and handle_logbook_mode_input(chat_id, text):
+        elif text and handle_logbook_mode_input(chat_id, text):
             return jsonify({"status": "ok"})
-        return jsonify({"status": "logbook_mode_waiting"})
+        else:
+            return jsonify({"status": "logbook_mode_waiting"})
+
+
 
     if command in {"post", "postok", "cancelpost", "review"}:
         ok, remaining = rate_limit_ok(chat_id)

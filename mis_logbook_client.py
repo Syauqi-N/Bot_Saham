@@ -1005,3 +1005,163 @@ def submit_logbook_entry(entry: LogbookEntry, config: LogbookConfig) -> Tuple[bo
         return True, "Logbook berhasil disubmit."
 
     return True, "Submit logbook terkirim. Cek halaman MIS untuk verifikasi final."
+
+
+# ---------------------------------------------------------------------------
+# File upload
+# ---------------------------------------------------------------------------
+
+class LogbookFileType:
+    PDF = "pdf"    # Progres laporan KP (PDF, max 1 MB) → field fileupload / kirimfile1
+    PHOTO = "photo"  # Foto kegiatan KP (JPG/JPEG, max 500 KB) → field fileupload2 / kirimfile2
+
+
+def upload_logbook_file(
+    file_bytes: bytes,
+    filename: str,
+    file_type: str,
+    config: LogbookConfig,
+) -> Tuple[bool, str]:
+    """Upload logbook file (PDF laporan or JPG foto) to MIS.
+
+    Replicates browser kirim_file1() / kirim_file2() which set kirimfile1/kirimfile2=1
+    and submit the parent <form id="kirim"> as multipart/form-data to mEntry_Logbook_KP1.php.
+
+    Args:
+        file_bytes: Raw bytes of the file to upload.
+        filename: Original filename including extension.
+        file_type: LogbookFileType.PDF or LogbookFileType.PHOTO.
+        config: LogbookConfig with CAS credentials.
+
+    Returns:
+        (success, message)
+    """
+    if not file_bytes:
+        return False, "File kosong, tidak ada yang diunggah."
+
+    # Validate extension / mimetype
+    fn_lower = filename.lower() if filename else ""
+    if file_type == LogbookFileType.PDF:
+        if not fn_lower.endswith(".pdf"):
+            return False, "File progres laporan harus berekstensi PDF."
+        file_field = "fileupload"
+        trigger_field = "kirimfile1"
+        mimetype = "application/pdf"
+        max_bytes = 1 * 1024 * 1024  # 1 MB
+        label = "laporan PDF"
+    elif file_type == LogbookFileType.PHOTO:
+        if not any(fn_lower.endswith(ext) for ext in (".jpg", ".jpeg")):
+            return False, "Foto kegiatan harus berekstensi JPG/JPEG."
+        file_field = "fileupload2"
+        trigger_field = "kirimfile2"
+        mimetype = "image/jpeg"
+        max_bytes = 500 * 1024  # 500 KB
+        label = "foto JPG"
+    else:
+        return False, f"Tipe file tidak dikenal: {file_type!r}."
+
+    if len(file_bytes) > max_bytes:
+        size_kb = len(file_bytes) // 1024
+        max_kb = max_bytes // 1024
+        return False, f"Ukuran file {size_kb} KB melebihi batas {max_kb} KB untuk {label}."
+
+    timeout = (config.timeout_connect, config.timeout_read)
+    session = requests.Session()
+
+    # CAS login
+    try:
+        cas_page = session.get(config.cas_login_url, timeout=timeout)
+    except requests.exceptions.RequestException as exc:
+        return False, f"Gagal membuka halaman login CAS: {exc}"
+    if cas_page.status_code >= 400:
+        return False, f"Halaman login CAS error HTTP {cas_page.status_code}."
+
+    cas_action_url, cas_payload, cas_error = parse_cas_login_form(
+        cas_page.text, cas_page.url or config.cas_login_url
+    )
+    if cas_error or not cas_action_url or cas_payload is None:
+        return False, cas_error or "Form login CAS tidak valid."
+
+    cas_payload = dict(cas_payload)
+    user_key = "username" if "username" in cas_payload else next(
+        (k for k in cas_payload if "user" in k.lower()), "username"
+    )
+    pass_key = "password" if "password" in cas_payload else next(
+        (k for k in cas_payload if "pass" in k.lower()), "password"
+    )
+    cas_payload[user_key] = config.username
+    cas_payload[pass_key] = config.password
+
+    try:
+        login_resp = session.post(cas_action_url, data=cas_payload, timeout=timeout, allow_redirects=True)
+    except requests.exceptions.RequestException as exc:
+        return False, f"Gagal login CAS: {exc}"
+    if login_resp.status_code >= 400:
+        return False, f"Login CAS gagal HTTP {login_resp.status_code}."
+    if _looks_like_cas_login_page(login_resp.text, login_resp.url or ""):
+        return False, _extract_cas_error(login_resp.text) or "Autentikasi CAS gagal."
+
+    # Fetch shell page + AJAX page to get hidden field values
+    try:
+        shell = session.get(config.form_url, timeout=timeout)
+    except requests.exceptions.RequestException as exc:
+        return False, f"Gagal membuka halaman logbook MIS: {exc}"
+    if shell.status_code >= 400:
+        return False, f"Halaman logbook MIS error HTTP {shell.status_code}."
+    if _looks_like_mis_login_required(shell.text):
+        return False, "Session MIS tidak aktif saat upload file."
+
+    ajax_ctx, ctx_error = _fetch_logbook_kp1_ajax_page(
+        session=session,
+        base_url=shell.url or config.form_url,
+        shell_html=shell.text,
+        timeout=timeout,
+    )
+    if ajax_ctx is None:
+        return False, ctx_error or "Gagal fetch data dari halaman AJAX logbook."
+
+    # POST multipart to mEntry_Logbook_KP1.php (the parent shell form)
+    # replicating: document.getElementById('kirimfileX').value=1; document.kirim.submit();
+    shell_url = shell.url or config.form_url
+    data_fields = {
+        trigger_field: "1",
+        "kp_daftar": ajax_ctx["kp_daftar"],
+        "mahasiswa": ajax_ctx["mahasiswa"],
+        "tanggal": ajax_ctx["tanggal"],
+        "minggu": ajax_ctx["val_minggu"],
+        "tahun": ajax_ctx["val_tahun"],
+        "cbSemester": ajax_ctx["val_semester"],
+    }
+    files_mp = {
+        file_field: (filename, file_bytes, mimetype),
+    }
+    # Add text fields as (None, value) tuples alongside the actual file tuple
+    for key, val in data_fields.items():
+        files_mp[key] = (None, val)  # type: ignore[assignment]
+
+    try:
+        up_resp = session.post(shell_url, files=files_mp, timeout=timeout, allow_redirects=True)
+    except requests.exceptions.RequestException as exc:
+        return False, f"Gagal upload file ke MIS: {exc}"
+
+    if up_resp.status_code >= 400:
+        return False, f"Upload file gagal HTTP {up_resp.status_code}."
+    if _looks_like_cas_login_page(up_resp.text, up_resp.url or ""):
+        return False, "Session CAS berakhir saat upload file."
+
+    resp_text = _normalize(BeautifulSoup(up_resp.text or "", "html.parser").get_text(" ", strip=True))
+    success_hints = ["berhasil", "tersimpan", "sukses", "disimpan", "terunggah", "uploaded"]
+    if any(h in resp_text for h in success_hints):
+        return True, f"File {label} berhasil diunggah."
+
+    error_hints = ["gagal", "error", "tidak valid", "tidak diizinkan", "melebihi"]
+    for hint in error_hints:
+        if hint in resp_text:
+            return False, f"Upload {label} ditolak server MIS. Pastikan format dan ukuran file sesuai."
+
+    # Treat as success if page reloaded correctly (no error, not login page)
+    if not _looks_like_mis_login_required(up_resp.text):
+        return True, f"File {label} terkirim ke MIS. Cek halaman untuk verifikasi."
+
+    return False, f"Upload {label} kemungkinan gagal. Cek halaman MIS secara manual."
+
