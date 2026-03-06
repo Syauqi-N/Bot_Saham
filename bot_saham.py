@@ -269,6 +269,8 @@ def extract_media(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     mimetype = source.get("mimetype") or source.get("mimeType") or source.get("mediaType")
     filename = source.get("filename") or source.get("fileName")
     data_base64 = source.get("data") or source.get("base64")
+    # Also grab messageId & id for WAHA downloadMedia fallback
+    msg_id = data.get("id") or data.get("messageId") or data.get("_serialized")
 
     if not any([url, mimetype, filename, data_base64, data.get("hasMedia")]):
         return None
@@ -277,6 +279,7 @@ def extract_media(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "mimetype": str(mimetype).strip() if mimetype else None,
         "filename": str(filename).strip() if filename else None,
         "data": str(data_base64).strip() if data_base64 else None,
+        "messageId": str(msg_id).strip() if msg_id else None,
     }
 
 
@@ -578,15 +581,20 @@ def handle_logbook_file_upload(chat_id: str, media: Dict[str, Any]) -> bool:
         )
         return True
 
-    media_url = media.get("url")
-    if not media_url:
-        send_text(chat_id, "URL file tidak tersedia. Coba kirim ulang atau ketik !skip.")
-        return True
+    # Log media info for diagnostics
+    logger.info(
+        "handle_logbook_file_upload: mimetype=%s filename=%s url=%s has_data=%s",
+        media.get("mimetype"), media.get("filename"),
+        media.get("url"), bool(media.get("data")),
+    )
 
     send_text(chat_id, "Sedang mengunggah file ke MIS, tunggu sebentar...")
-    file_bytes = download_waha_media(str(media_url))
+    file_bytes = fetch_media_bytes(media)
     if not file_bytes:
-        send_text(chat_id, "Gagal mengunduh file dari WhatsApp. Coba kirim ulang atau ketik !skip.")
+        send_text(
+            chat_id,
+            "Gagal mengunduh file dari WhatsApp. Coba kirim ulang file-nya atau ketik !skip.",
+        )
         return True
 
     ok, msg = upload_logbook_file(
@@ -907,22 +915,129 @@ def send_text(chat_id: str, text: str) -> None:
         logger.exception("WAHA sendText error: %s", exc)
 
 
-def download_waha_media(url: str) -> Optional[bytes]:
-    """Download media bytes from a WAHA media URL."""
-    if not url:
-        return None
+def _rewrite_waha_media_url(url: str) -> str:
+    """Replace the host/port in a WAHA media URL with WAHA_BASE_URL.
+
+    WAHA webhook payloads include media.url like:
+        http://localhost:3000/api/default/download/...
+    But the bot may reach WAHA via a different host (e.g., http://waha:3000 in Docker).
+    This replaces the origin so the URL is always reachable from the bot.
+    """
+    if not url or not WAHA_BASE_URL:
+        return url
+    try:
+        from urllib.parse import urlparse, urlunparse
+        parsed_media = urlparse(url)
+        parsed_base = urlparse(WAHA_BASE_URL)
+        rewritten = urlunparse(parsed_media._replace(
+            scheme=parsed_base.scheme,
+            netloc=parsed_base.netloc,
+        ))
+        if rewritten != url:
+            logger.debug("_rewrite_waha_media_url: %s → %s", url, rewritten)
+        return rewritten
+    except Exception:
+        return url
+
+
+def _get_waha_headers() -> Dict[str, str]:
+
     headers: Dict[str, str] = {}
     if WAHA_API_KEY:
         headers["X-API-Key"] = WAHA_API_KEY
         headers["Authorization"] = f"Bearer {WAHA_API_KEY}"
+    return headers
+
+
+def download_waha_media(url: str) -> Optional[bytes]:
+    """Download media bytes from a WAHA media URL."""
+    if not url:
+        return None
     try:
-        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        resp = requests.get(url, headers=_get_waha_headers(), timeout=HTTP_TIMEOUT)
         if resp.status_code == 200:
             return resp.content
-        logger.error("download_waha_media failed: %s %s", resp.status_code, url)
+        logger.error("download_waha_media failed: HTTP %s url=%s", resp.status_code, url)
     except requests.exceptions.RequestException as exc:
-        logger.error("download_waha_media error: %s", exc)
+        logger.error("download_waha_media error: %s url=%s", exc, url)
     return None
+
+
+def fetch_media_bytes(media: Dict[str, Any]) -> Optional[bytes]:
+    """Get file bytes from a WAHA media dict.
+
+    Tries in order:
+    1. Base64 'data' field (most reliable, already in payload)
+    2. Direct URL download
+    3. WAHA GET /api/{session}/media/{messageId} (WAHA Plus)
+    4. WAHA POST downloadMedia endpoint
+    """
+    import base64
+
+    # 1. Try base64 data field (WAHA often includes this)
+    data_b64 = media.get("data")
+    if data_b64 and isinstance(data_b64, str):
+        # Strip data URI prefix if present: "data:image/jpeg;base64,/9j..."
+        b64_str = data_b64.split(",", 1)[1] if "," in data_b64 else data_b64
+        try:
+            decoded = base64.b64decode(b64_str)
+            if decoded:
+                logger.info("fetch_media_bytes: got %d bytes from base64 data", len(decoded))
+                return decoded
+        except Exception as exc:
+            logger.warning("fetch_media_bytes base64 decode failed: %s", exc)
+
+    url = media.get("url")
+    if url:
+        url = _rewrite_waha_media_url(str(url))
+
+    # 2. Direct URL download
+    if url:
+        logger.info("fetch_media_bytes: trying direct URL: %s", url)
+        result = download_waha_media(url)
+        if result:
+            logger.info("fetch_media_bytes: got %d bytes from URL", len(result))
+            return result
+
+    # 3. WAHA GET media by messageId (WAHA Plus / some newer versions)
+    msg_id = media.get("messageId")
+    if msg_id:
+        for endpoint in [
+            f"{WAHA_BASE_URL}/api/{WAHA_SESSION}/messages/{msg_id}/download",
+            f"{WAHA_BASE_URL}/api/{WAHA_SESSION}/messages/{msg_id}/media",
+        ]:
+            try:
+                resp = requests.get(endpoint, headers=_get_waha_headers(), timeout=HTTP_TIMEOUT)
+                if resp.status_code == 200 and resp.content:
+                    logger.info("fetch_media_bytes: got %d bytes via messageId endpoint %s", len(resp.content), endpoint)
+                    return resp.content
+                logger.debug("fetch_media_bytes messageId endpoint %s → HTTP %s", endpoint, resp.status_code)
+            except requests.exceptions.RequestException as exc:
+                logger.debug("fetch_media_bytes messageId endpoint %s error: %s", endpoint, exc)
+
+    # 4. WAHA POST /api/{session}/messages/download endpoint
+    if url:
+        try:
+            dl_url = f"{WAHA_BASE_URL}/api/{WAHA_SESSION}/messages/download"
+            resp = requests.post(
+                dl_url,
+                json={"url": url},
+                headers={**_get_waha_headers(), "Content-Type": "application/json"},
+                timeout=HTTP_TIMEOUT,
+            )
+            if resp.status_code == 200 and resp.content:
+                logger.info("fetch_media_bytes: got %d bytes from WAHA POST downloadMedia", len(resp.content))
+                return resp.content
+            logger.warning("fetch_media_bytes WAHA POST downloadMedia → HTTP %s", resp.status_code)
+        except requests.exceptions.RequestException as exc:
+            logger.warning("fetch_media_bytes WAHA POST downloadMedia error: %s", exc)
+
+    logger.warning(
+        "fetch_media_bytes: all strategies failed. url=%s has_data=%s msg_id=%s",
+        url, bool(data_b64), msg_id,
+    )
+    return None
+
 
 
 def sanitize_debug_error(error: Optional[str], limit: int = 300) -> str:
@@ -1150,6 +1265,22 @@ def webhook() -> Any:
         session = get_logbook_session(chat_id)
 
         # --- State: awaiting_file (after successful logbook submit) ---
+        if session and session.get("status") == "awaiting_file" and media:
+            # Log raw media payload to diagnose download issues
+            import json as _json
+            logger.info(
+                "WAHA media payload (awaiting_file): mimetype=%s filename=%s url=%s "
+                "has_data=%s data_len=%s messageId=%s",
+                media.get("mimetype"), media.get("filename"), media.get("url"),
+                bool(media.get("data")), len(str(media.get("data") or "")),
+                media.get("messageId"),
+            )
+            try:
+                with open("/tmp/waha_media_debug.json", "w") as _f:
+                    _json.dump(payload, _f, indent=2, default=str)
+            except Exception:
+                pass
+
         if session and session.get("status") == "awaiting_file":
             if media and handle_logbook_file_upload(chat_id, media):
                 return jsonify({"status": "ok"})
