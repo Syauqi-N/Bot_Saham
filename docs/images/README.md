@@ -7,7 +7,6 @@ This folder contains the README visual assets referenced by relative path.
 - `02-post-mode-input.png`
 - `03-review-draft.png`
 - `04-post-publish-success.png`
-- `05-waha-webhook-settings.png`
 - `06-e2e-post-flow.gif`
 
 ## Redaction checklist (strict)
@@ -16,7 +15,7 @@ Before committing real captures, mask all sensitive data:
 - Chat IDs / LID IDs
 - API tokens and keys
 - Private server URLs/IPs
-- Webhook secrets or session identifiers
+- Bot tokens or session identifiers
 
 ## Style checklist
 - Keep consistent width and readable crop

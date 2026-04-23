@@ -1,7 +1,6 @@
 import base64
 import os
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 
@@ -98,104 +97,6 @@ def _upload_binary(upload_url: str, media_bytes: bytes, mimetype: str) -> Option
         return f"Gagal upload media ke LinkedIn: {exc}"
 
 
-def _candidate_media_urls(media_url: str, waha_base_url: Optional[str]) -> Tuple[str, ...]:
-    raw = (media_url or "").strip()
-    if not raw:
-        return ()
-
-    candidates = []
-    parsed = urlparse(raw)
-
-    if not parsed.scheme:
-        base = (waha_base_url or "").rstrip("/") + "/"
-        if base:
-            candidates.append(urljoin(base, raw.lstrip("/")))
-        else:
-            candidates.append(raw)
-    else:
-        candidates.append(raw)
-
-    if not waha_base_url:
-        return tuple(dict.fromkeys(candidates))
-
-    base_parsed = urlparse(waha_base_url)
-    if not base_parsed.scheme or not base_parsed.netloc:
-        return tuple(dict.fromkeys(candidates))
-
-    parsed_first = urlparse(candidates[0])
-    local_hosts = {"localhost", "127.0.0.1", "0.0.0.0"}
-    if parsed_first.hostname in local_hosts:
-        replaced = urlunparse(
-            (
-                base_parsed.scheme,
-                base_parsed.netloc,
-                parsed_first.path,
-                parsed_first.params,
-                parsed_first.query,
-                parsed_first.fragment,
-            )
-        )
-        candidates.append(replaced)
-
-    # WAHA versions/configs may expose files as either:
-    # - /api/files/<session>/<filename>
-    # - /api/files/<filename>
-    expanded = list(candidates)
-    for item in list(candidates):
-        parsed_item = urlparse(item)
-        path = parsed_item.path or ""
-        parts = path.split("/")
-        # ['', 'api', 'files', '<session>', '<filename...>']
-        if len(parts) >= 5 and parts[1] == "api" and parts[2] == "files" and parts[3]:
-            short_path = "/api/files/" + "/".join(parts[4:])
-            expanded.append(
-                urlunparse(
-                    (
-                        parsed_item.scheme,
-                        parsed_item.netloc,
-                        short_path,
-                        parsed_item.params,
-                        parsed_item.query,
-                        parsed_item.fragment,
-                    )
-                )
-            )
-
-    return tuple(dict.fromkeys(expanded))
-
-
-def _download_media_from_url(
-    media_url: str,
-    waha_api_key: Optional[str],
-    waha_base_url: Optional[str],
-) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-    headers: Dict[str, str] = {}
-    if waha_api_key:
-        headers["X-API-Key"] = waha_api_key
-        headers["Authorization"] = f"Bearer {waha_api_key}"
-    attempts = _candidate_media_urls(media_url, waha_base_url)
-    if not attempts:
-        return None, None, "URL media WAHA kosong."
-
-    errors = []
-    for candidate in attempts:
-        try:
-            response = _session.get(
-                candidate,
-                headers=headers,
-                timeout=(LINKEDIN_TIMEOUT_CONNECT, LINKEDIN_TIMEOUT_READ),
-            )
-            if response.status_code >= 400:
-                errors.append(f"{candidate} -> HTTP {response.status_code}")
-                continue
-            content_type = str(response.headers.get("Content-Type", "application/octet-stream")).split(";")[0]
-            return response.content, content_type, None
-        except requests.exceptions.RequestException as exc:
-            errors.append(f"{candidate} -> {exc}")
-
-    return None, None, "Gagal download media WAHA: " + " | ".join(errors[:2])
-
-
 def _decode_media_base64(media_data: str) -> Tuple[Optional[bytes], Optional[str]]:
     try:
         return base64.b64decode(media_data, validate=True), None
@@ -255,8 +156,6 @@ def create_linkedin_image_post(
     media_url: Optional[str] = None,
     media_data_base64: Optional[str] = None,
     media_mimetype: Optional[str] = None,
-    waha_api_key: Optional[str] = None,
-    waha_base_url: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     if not LINKEDIN_ACCESS_TOKEN:
         return None, "LINKEDIN_ACCESS_TOKEN belum di-set."
@@ -307,18 +206,10 @@ def create_linkedin_image_post(
             media_bytes, decode_error = _decode_media_base64(item_data)
             if decode_error:
                 return None, f"Gambar #{index}: {decode_error}"
-        elif item_url:
-            media_bytes, detected_mime, download_error = _download_media_from_url(
-                item_url,
-                waha_api_key,
-                waha_base_url,
-            )
-            if download_error:
-                return None, f"Gambar #{index}: {download_error}"
-            if detected_mime:
-                resolved_mimetype = detected_mime
         else:
-            return None, f"Gambar #{index}: media URL/data kosong."
+            if item_url:
+                return None, f"Gambar #{index}: media URL tidak didukung lagi. Kirim data file langsung."
+            return None, f"Gambar #{index}: media data kosong."
 
         if not media_bytes:
             return None, f"Gambar #{index}: konten media kosong."

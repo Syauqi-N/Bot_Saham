@@ -1,5 +1,8 @@
+import base64
+import json
 import logging
 import math
+import mimetypes
 import os
 import re
 import time
@@ -8,7 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
 from tvDatafeed import Interval, TvDatafeed
 
 from ai_router import get_ai_reply, get_backend_savior_reply, summarize_news
@@ -17,8 +19,6 @@ from mis_logbook_client import LogbookConfig, LogbookEntry, LogbookFileType, sub
 from news_client import fetch_news
 
 load_dotenv()
-
-app = Flask(__name__)
 
 
 def env_int(name: str, default: int) -> int:
@@ -54,9 +54,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot_saham")
 
-WAHA_BASE_URL = env_str("WAHA_BASE_URL", "http://localhost:3000").rstrip("/")
-WAHA_SESSION = env_str("WAHA_SESSION", "default")
-WAHA_API_KEY = os.getenv("WAHA_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_API_BASE_URL = env_str("TELEGRAM_API_BASE_URL", "https://api.telegram.org").rstrip("/")
+TELEGRAM_POLL_TIMEOUT_SECONDS = max(1, env_int("TELEGRAM_POLL_TIMEOUT_SECONDS", 30))
+TELEGRAM_DROP_PENDING_UPDATES = env_bool("TELEGRAM_DROP_PENDING_UPDATES", True)
 
 TRADINGVIEW_USERNAME = os.getenv("TRADINGVIEW_USERNAME", "")
 TRADINGVIEW_PASSWORD = os.getenv("TRADINGVIEW_PASSWORD", "")
@@ -73,6 +74,11 @@ BACKEND_SAVIOR_DEBUG = env_bool("BACKEND_SAVIOR_DEBUG", True)
 POST_SESSION_TTL_SECONDS = env_int("POST_SESSION_TTL_SECONDS", 900)
 LINKEDIN_CAPTION_MAX_CHARS = env_int("LINKEDIN_CAPTION_MAX_CHARS", 3000)
 LINKEDIN_MAX_IMAGES = max(1, min(3, env_int("LINKEDIN_MAX_IMAGES", 3)))
+LINKEDIN_ALLOWED_CHAT_IDS = {
+    item.strip()
+    for item in env_str("LINKEDIN_ALLOWED_CHAT_IDS", "").split(",")
+    if item.strip()
+}
 LOGBOOK_ENABLED = env_bool("LOGBOOK_ENABLED", True)
 LOGBOOK_ALLOWED_CHAT_IDS = {
     item.strip()
@@ -94,13 +100,23 @@ LOGBOOK_DEFAULT_CHECKBOX = env_bool("LOGBOOK_DEFAULT_CHECKBOX", True)
 LOGBOOK_TIMEOUT_CONNECT = env_int("LOGBOOK_TIMEOUT_CONNECT", 10)
 LOGBOOK_TIMEOUT_READ = env_int("LOGBOOK_TIMEOUT_READ", 45)
 LOGBOOK_MATERIAL_MAX_CHARS = env_int("LOGBOOK_MATERIAL_MAX_CHARS", 4000)
+PORTFOLIO_API_BASE_URL = env_str("PORTFOLIO_API_BASE_URL", "").rstrip("/")
+PORTFOLIO_API_SECRET = os.getenv("PORTFOLIO_API_SECRET", "").strip()
+PORTFOLIO_ALLOWED_CHAT_IDS = {
+    item.strip()
+    for item in env_str("PORTFOLIO_ALLOWED_CHAT_IDS", "").split(",")
+    if item.strip()
+}
 
 HTTP_TIMEOUT = 15
+HTTP_CONNECT_TIMEOUT = 10
+POLL_RETRY_DELAY_SECONDS = 3
 
 cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 rate_limit: Dict[str, float] = {}
 post_drafts: Dict[str, Dict[str, Any]] = {}
 logbook_sessions: Dict[str, Dict[str, Any]] = {}
+portfolio_sessions: Dict[str, Dict[str, Any]] = {}
 
 INTERVAL_MAP = {
     "1m": Interval.in_1_minute,
@@ -114,6 +130,9 @@ tv_client: Optional[TvDatafeed] = None
 tv_client_error: Optional[str] = None
 
 http_session = requests.Session()
+
+if not LINKEDIN_ALLOWED_CHAT_IDS:
+    logger.warning("LINKEDIN_ALLOWED_CHAT_IDS kosong. !post diizinkan untuk semua chat.")
 
 if LOGBOOK_ENABLED:
     if not LOGBOOK_ALLOWED_CHAT_IDS:
@@ -234,6 +253,8 @@ def parse_command(text: str) -> Tuple[Optional[str], Optional[str]]:
     if re.match(r"^!news\b", lower):
         query = re.sub(r"^!news\s*", "", cleaned, flags=re.IGNORECASE).strip()
         return "news", normalize_news_query(query)
+    if re.match(r"^!porto\b", lower):
+        return "porto", None
     if re.match(r"^!logbook\b", lower):
         return "logbook", None
     if re.match(r"^!postok\b", lower):
@@ -262,41 +283,6 @@ def parse_command(text: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def extract_media(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    media = data.get("media")
-    source = media if isinstance(media, dict) else data
-    url = source.get("url") or source.get("link")
-    mimetype = source.get("mimetype") or source.get("mimeType") or source.get("mediaType")
-    filename = source.get("filename") or source.get("fileName")
-    data_base64 = source.get("data") or source.get("base64")
-    # Also grab messageId & id for WAHA downloadMedia fallback
-    msg_id = data.get("id") or data.get("messageId") or data.get("_serialized")
-
-    if not any([url, mimetype, filename, data_base64, data.get("hasMedia")]):
-        return None
-    return {
-        "url": str(url).strip() if url else None,
-        "mimetype": str(mimetype).strip() if mimetype else None,
-        "filename": str(filename).strip() if filename else None,
-        "data": str(data_base64).strip() if data_base64 else None,
-        "messageId": str(msg_id).strip() if msg_id else None,
-    }
-
-
-def extract_message(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], bool, Optional[Dict[str, Any]]]:
-    data = payload.get("payload", payload)
-    text = (
-        data.get("body")
-        or data.get("text")
-        or data.get("message")
-        or data.get("content")
-    )
-    chat_id = data.get("chatId") or data.get("chat_id") or data.get("from")
-    from_me = bool(data.get("fromMe") or data.get("from_me"))
-    media = extract_media(data)
-    return text, chat_id, from_me, media
-
-
 def is_valid_time_hhmm(value: str) -> bool:
     return bool(re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", str(value or "").strip()))
 
@@ -316,29 +302,50 @@ def build_logbook_config() -> LogbookConfig:
     )
 
 
-def normalize_whatsapp_chat_id(chat_id: str) -> str:
-    raw = str(chat_id or "").strip().lower()
-    if not raw:
-        return ""
-    if "@" not in raw:
-        digits = re.sub(r"\D", "", raw)
-        return digits or raw
-
-    user_part, domain = raw.split("@", 1)
-    if domain in {"c.us", "s.whatsapp.net"}:
-        digits = re.sub(r"\D", "", user_part)
-        return digits or raw
-    return raw
+def normalize_chat_id(chat_id: Any) -> str:
+    return str(chat_id or "").strip()
 
 
 def is_logbook_chat_allowed(chat_id: str) -> bool:
     if not LOGBOOK_ALLOWED_CHAT_IDS:
         return False
-    normalized_target = normalize_whatsapp_chat_id(chat_id)
+    normalized_target = normalize_chat_id(chat_id)
     for allowed in LOGBOOK_ALLOWED_CHAT_IDS:
-        if normalize_whatsapp_chat_id(allowed) == normalized_target:
+        if normalize_chat_id(allowed) == normalized_target:
             return True
     return False
+
+
+def is_linkedin_chat_allowed(chat_id: str) -> bool:
+    if not LINKEDIN_ALLOWED_CHAT_IDS:
+        return True
+    normalized_target = normalize_chat_id(chat_id)
+    for allowed in LINKEDIN_ALLOWED_CHAT_IDS:
+        if normalize_chat_id(allowed) == normalized_target:
+            return True
+    return False
+
+
+def is_portfolio_chat_allowed(chat_id: str) -> bool:
+    if not PORTFOLIO_ALLOWED_CHAT_IDS:
+        return False
+    normalized_target = normalize_chat_id(chat_id)
+    for allowed in PORTFOLIO_ALLOWED_CHAT_IDS:
+        if normalize_chat_id(allowed) == normalized_target:
+            return True
+    return False
+
+
+def decode_media_payload(media: Dict[str, Any]) -> Optional[bytes]:
+    data_b64 = str(media.get("data") or "").strip()
+    if not data_b64:
+        return None
+    normalized = data_b64.split(",", 1)[1] if "," in data_b64 else data_b64
+    try:
+        return base64.b64decode(normalized)
+    except Exception as exc:
+        logger.warning("decode_media_payload failed: %s", exc)
+        return None
 
 
 def new_logbook_session() -> Dict[str, Any]:
@@ -505,21 +512,22 @@ def handle_logbook_command(chat_id: str, command: str) -> str:
         success, message = submit_logbook_entry(entry, build_logbook_config())
         if success:
             logger.info("Logbook submitted successfully for chat_id=%s date=%s", chat_id, entry.date)
-            # Keep session in awaiting_file state for optional file upload
             session["status"] = "awaiting_file"
             session["pdf_uploaded"] = False
             session["photo_uploaded"] = False
             save_logbook_session(chat_id, session)
             send_text(
                 chat_id,
-                "\n".join([
-                    message,
-                    "",
-                    "📎 Unggah file opsional:",
-                    "- Kirim file PDF (laporan progres, maks 1 MB)",
-                    "- Kirim foto JPG/JPEG (foto kegiatan, maks 500 KB)",
-                    "- Ketik !skip untuk lewati",
-                ]),
+                "\n".join(
+                    [
+                        message,
+                        "",
+                        "📎 Unggah file opsional:",
+                        "- Kirim file PDF (laporan progres, maks 1 MB)",
+                        "- Kirim foto JPG/JPEG (foto kegiatan, maks 500 KB)",
+                        "- Ketik !skip untuk lewati",
+                    ]
+                ),
             )
             return "ok"
 
@@ -544,36 +552,33 @@ def is_pdf_media(media: Dict[str, Any]) -> bool:
     mimetype = str(media.get("mimetype") or "").lower()
     if mimetype:
         return mimetype in ("application/pdf", "application/x-pdf")
-    url = str(media.get("url") or "").lower()
-    fn = str(media.get("filename") or "").lower()
-    return url.endswith(".pdf") or fn.endswith(".pdf")
+    filename = str(media.get("filename") or "").lower()
+    return filename.endswith(".pdf")
 
 
 def is_jpeg_media(media: Dict[str, Any]) -> bool:
     mimetype = str(media.get("mimetype") or "").lower()
     if mimetype:
         return mimetype in ("image/jpeg", "image/jpg")
-    url = str(media.get("url") or "").lower()
-    fn = str(media.get("filename") or "").lower()
-    return any((url.endswith(e) or fn.endswith(e)) for e in (".jpg", ".jpeg"))
+    filename = str(media.get("filename") or "").lower()
+    return any(filename.endswith(ext) for ext in (".jpg", ".jpeg"))
 
 
 def handle_logbook_file_upload(chat_id: str, media: Dict[str, Any]) -> bool:
-    """Handle a media message while session is in awaiting_file state."""
     session = get_logbook_session(chat_id)
     if not session or session.get("status") != "awaiting_file":
         return False
 
     if is_pdf_media(media):
         file_type = LogbookFileType.PDF
-        fn = media.get("filename") or "laporan.pdf"
-        if not str(fn).lower().endswith(".pdf"):
-            fn = "laporan.pdf"
+        filename = media.get("filename") or "laporan.pdf"
+        if not str(filename).lower().endswith(".pdf"):
+            filename = "laporan.pdf"
     elif is_jpeg_media(media):
         file_type = LogbookFileType.PHOTO
-        fn = media.get("filename") or "foto.jpg"
-        if not any(str(fn).lower().endswith(e) for e in (".jpg", ".jpeg")):
-            fn = "foto.jpg"
+        filename = media.get("filename") or "foto.jpg"
+        if not any(str(filename).lower().endswith(ext) for ext in (".jpg", ".jpeg")):
+            filename = "foto.jpg"
     else:
         send_text(
             chat_id,
@@ -581,30 +586,27 @@ def handle_logbook_file_upload(chat_id: str, media: Dict[str, Any]) -> bool:
         )
         return True
 
-    # Log media info for diagnostics
-    logger.info(
-        "handle_logbook_file_upload: mimetype=%s filename=%s url=%s has_data=%s",
-        media.get("mimetype"), media.get("filename"),
-        media.get("url"), bool(media.get("data")),
-    )
-
     send_text(chat_id, "Sedang mengunggah file ke MIS, tunggu sebentar...")
-    file_bytes = fetch_media_bytes(media)
+    file_bytes = decode_media_payload(media)
     if not file_bytes:
         send_text(
             chat_id,
-            "Gagal mengunduh file dari WhatsApp. Coba kirim ulang file-nya atau ketik !skip.",
+            "Gagal membaca file dari Telegram. Coba kirim ulang file-nya atau ketik !skip.",
         )
         return True
 
     ok, msg = upload_logbook_file(
         file_bytes=file_bytes,
-        filename=str(fn),
+        filename=str(filename),
         file_type=file_type,
         config=build_logbook_config(),
     )
     logger.info(
-        "Logbook file upload chat_id=%s type=%s ok=%s msg=%s", chat_id, file_type, ok, msg
+        "Logbook file upload chat_id=%s type=%s ok=%s msg=%s",
+        chat_id,
+        file_type,
+        ok,
+        msg,
     )
 
     if file_type == LogbookFileType.PDF:
@@ -667,9 +669,10 @@ def ensure_post_images_schema(draft: Dict[str, Any]) -> Dict[str, Any]:
             url = str(item.get("url") or "").strip() or None
             data = str(item.get("data") or "").strip() or None
             mimetype = str(item.get("mimetype") or "").strip() or "image/jpeg"
+            filename = str(item.get("filename") or "").strip() or None
             if not url and not data:
                 continue
-            images.append({"url": url, "data": data, "mimetype": mimetype})
+            images.append({"url": url, "data": data, "mimetype": mimetype, "filename": filename})
 
     legacy_url = str(draft.get("image_url") or "").strip() or None
     legacy_data = str(draft.get("image_data") or "").strip() or None
@@ -677,7 +680,7 @@ def ensure_post_images_schema(draft: Dict[str, Any]) -> Dict[str, Any]:
     if (legacy_url or legacy_data) and len(images) < LINKEDIN_MAX_IMAGES:
         duplicated = any(item.get("url") == legacy_url and item.get("data") == legacy_data for item in images)
         if not duplicated:
-            images.append({"url": legacy_url, "data": legacy_data, "mimetype": legacy_mimetype})
+            images.append({"url": legacy_url, "data": legacy_data, "mimetype": legacy_mimetype, "filename": None})
 
     draft["images"] = images[:LINKEDIN_MAX_IMAGES]
     draft.pop("image_url", None)
@@ -719,8 +722,8 @@ def is_image_media(media: Dict[str, Any]) -> bool:
     mimetype = str(media.get("mimetype") or "").lower()
     if mimetype:
         return mimetype.startswith("image/")
-    url = str(media.get("url") or "").lower()
-    return url.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"))
+    filename = str(media.get("filename") or "").lower()
+    return filename.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"))
 
 
 def handle_post_mode_input(chat_id: str, text: Optional[str], media: Optional[Dict[str, Any]]) -> bool:
@@ -734,10 +737,9 @@ def handle_post_mode_input(chat_id: str, text: Optional[str], media: Optional[Di
         if not is_image_media(media):
             send_text(chat_id, "Mode !post hanya menerima file gambar (image/*).")
             return True
-        image_url = media.get("url")
         image_data = media.get("data")
-        if not image_url and not image_data:
-            send_text(chat_id, "Gambar terdeteksi, tapi URL/data media kosong. Coba kirim ulang gambarnya.")
+        if not image_data:
+            send_text(chat_id, "Gambar terdeteksi, tapi data medianya kosong. Coba kirim ulang gambarnya.")
             return True
         images = list(draft.get("images") or [])
         if len(images) >= LINKEDIN_MAX_IMAGES:
@@ -748,9 +750,10 @@ def handle_post_mode_input(chat_id: str, text: Optional[str], media: Optional[Di
         else:
             images.append(
                 {
-                    "url": image_url,
+                    "url": None,
                     "data": image_data,
                     "mimetype": media.get("mimetype") or "image/jpeg",
+                    "filename": media.get("filename"),
                 }
             )
             draft["images"] = images
@@ -807,6 +810,10 @@ def format_post_draft_review(draft: Dict[str, Any]) -> str:
 
 def handle_post_command(chat_id: str, command: str) -> str:
     if command == "post":
+        if not is_linkedin_chat_allowed(chat_id):
+            logger.warning("LinkedIn post access denied for chat_id=%s", chat_id)
+            send_text(chat_id, "Kamu tidak diizinkan memakai fitur LinkedIn post ini.")
+            return "ok"
         save_post_draft(
             chat_id,
             {
@@ -857,8 +864,6 @@ def handle_post_command(chat_id: str, command: str) -> str:
         post_id, error = create_linkedin_image_post(
             caption=str(draft.get("caption", "")).strip(),
             media_items=list(draft.get("images") or []),
-            waha_api_key=WAHA_API_KEY or None,
-            waha_base_url=WAHA_BASE_URL or None,
         )
         if error:
             send_text(
@@ -887,6 +892,990 @@ def handle_post_command(chat_id: str, command: str) -> str:
     return "ignored"
 
 
+def get_portfolio_session(chat_id: str) -> Optional[Dict[str, Any]]:
+    session = portfolio_sessions.get(chat_id)
+    if not session:
+        return None
+    updated_at = float(session.get("updated_at", 0.0))
+    if updated_at and time.time() - updated_at > POST_SESSION_TTL_SECONDS:
+        portfolio_sessions.pop(chat_id, None)
+        return None
+    return session
+
+
+def save_portfolio_session(chat_id: str, session: Dict[str, Any]) -> None:
+    now = time.time()
+    if "created_at" not in session:
+        session["created_at"] = now
+    session["updated_at"] = now
+    portfolio_sessions[chat_id] = session
+
+
+def clear_portfolio_session(chat_id: str) -> None:
+    portfolio_sessions.pop(chat_id, None)
+
+
+def portfolio_api_request(method: str, path: str, payload: Optional[Any] = None) -> Tuple[Optional[Any], Optional[str]]:
+    if not PORTFOLIO_API_BASE_URL:
+        return None, "PORTFOLIO_API_BASE_URL belum di-set."
+    if not PORTFOLIO_API_SECRET:
+        return None, "PORTFOLIO_API_SECRET belum di-set."
+
+    url = f"{PORTFOLIO_API_BASE_URL.rstrip('/')}{path}"
+    headers = {"X-Portfolio-Secret": PORTFOLIO_API_SECRET}
+    try:
+        response = http_session.request(
+            method.upper(),
+            url,
+            json=payload,
+            headers=headers,
+            timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT),
+        )
+    except requests.exceptions.RequestException as exc:
+        return None, f"Portfolio API error: {exc}"
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+
+    if response.status_code >= 400:
+        error = body.get("error") if isinstance(body, dict) else None
+        return None, error or f"Portfolio API HTTP {response.status_code}"
+    return body, None
+
+
+def portfolio_snapshot() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    data, error = portfolio_api_request("GET", "/api/admin/portfolio")
+    if error:
+        return None, error
+    if not isinstance(data, dict):
+        return None, "Portfolio API mengembalikan data tidak valid."
+    return data, None
+
+
+PORTFOLIO_PROJECT_FIELDS: List[Tuple[str, str]] = [
+    ("title", "Title"),
+    ("summary", "Summary"),
+    ("status", "Status"),
+    ("featured", "Featured"),
+    ("tech", "Tech Stack"),
+    ("description", "Description"),
+    ("repo", "Repo URL"),
+    ("demo", "Demo URL"),
+]
+
+PORTFOLIO_PROFILE_FIELDS: List[Tuple[str, str]] = [
+    ("name", "Name"),
+    ("role", "Role"),
+    ("headline", "Headline"),
+    ("bio", "Bio"),
+    ("location", "Location"),
+    ("email", "Email"),
+]
+
+PORTFOLIO_SOCIAL_FIELDS: List[Tuple[str, str]] = [
+    ("github", "GitHub URL"),
+    ("linkedin", "LinkedIn URL"),
+    ("whatsapp", "WhatsApp URL"),
+    ("portfolio", "Portfolio URL"),
+]
+
+PORTFOLIO_ADD_PROJECT_STEPS = ["title", "slug", "summary", "status", "featured", "tech", "description", "review"]
+
+
+def format_portfolio_projects(projects: List[Dict[str, Any]]) -> str:
+    if not projects:
+        return "Belum ada project portfolio."
+
+    lines = ["Projects portfolio:"]
+    for index, project in enumerate(projects, start=1):
+        slug = project.get("slug") or "-"
+        title = project.get("title") or "-"
+        status = project.get("status") or "-"
+        featured = " featured" if project.get("featured") else ""
+        lines.append(f"{index}. {title} [{slug}] ({status}{featured})")
+    return "\n".join(lines)
+
+
+def parse_boolean_choice(value: str) -> Optional[bool]:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on", "ya"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off", "tidak", "enggak", "nggak"}:
+        return False
+    return None
+
+
+def parse_project_status_choice(value: str) -> Optional[str]:
+    normalized = value.strip().lower()
+    mapping = {
+        "1": "live",
+        "2": "wip",
+        "3": "private",
+        "4": "archived",
+        "live": "live",
+        "wip": "wip",
+        "private": "private",
+        "archived": "archived",
+    }
+    return mapping.get(normalized)
+
+
+def normalize_project_slug(value: str) -> Optional[str]:
+    slug = value.strip().lower().replace(" ", "-")
+    if re.match(r"^[a-z0-9]+(?:-[a-z0-9]+)*$", slug):
+        return slug
+    return None
+
+
+def portfolio_menu_text() -> str:
+    return "\n".join(
+        [
+            "Mode !porto aktif.",
+            "",
+            "Menu utama:",
+            "1. Lihat projects",
+            "2. Tambah project",
+            "3. Edit project",
+            "4. Hapus project",
+            "5. Edit profile",
+            "6. Edit social links",
+            "0. Keluar",
+            "",
+            "Perintah umum: menu | back | save | cancel",
+            "Catatan: Tech stack dan experiences tetap lewat web admin.",
+        ]
+    )
+
+
+def send_portfolio_menu(chat_id: str, prefix: Optional[str] = None) -> None:
+    text = portfolio_menu_text()
+    if prefix:
+        text = f"{prefix}\n\n{text}"
+    send_text(chat_id, text)
+
+
+def reset_portfolio_session(session: Dict[str, Any]) -> None:
+    created_at = session.get("created_at")
+    session.clear()
+    if created_at is not None:
+        session["created_at"] = created_at
+    session["status"] = "active"
+    session["flow"] = "menu"
+    session["step"] = "menu"
+
+
+def portfolio_action_from_input(value: str) -> Optional[str]:
+    normalized = value.strip().lower()
+    mapping = {
+        "1": "list_projects",
+        "list": "list_projects",
+        "projects": "list_projects",
+        "2": "add_project",
+        "add": "add_project",
+        "tambah": "add_project",
+        "3": "edit_project",
+        "edit": "edit_project",
+        "4": "delete_project",
+        "delete": "delete_project",
+        "hapus": "delete_project",
+        "5": "edit_profile",
+        "profile": "edit_profile",
+        "6": "edit_social",
+        "social": "edit_social",
+        "links": "edit_social",
+    }
+    return mapping.get(normalized)
+
+
+def find_portfolio_project(snapshot: Dict[str, Any], slug: str) -> Optional[Dict[str, Any]]:
+    for project in snapshot.get("projects") or []:
+        if isinstance(project, dict) and str(project.get("slug") or "") == slug:
+            return dict(project)
+    return None
+
+
+def normalize_portfolio_project(project: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "slug": str(project.get("slug") or ""),
+        "title": str(project.get("title") or ""),
+        "summary": str(project.get("summary") or ""),
+        "description": str(project.get("description") or ""),
+        "status": str(project.get("status") or "wip"),
+        "featured": bool(project.get("featured")),
+        "techStack": list(project.get("techStack") or []),
+        "repoUrl": project.get("repoUrl") or "",
+        "demoUrl": project.get("demoUrl") or "",
+    }
+
+
+def format_portfolio_project_review(project: Dict[str, Any], title: str) -> str:
+    data = normalize_portfolio_project(project)
+    tech_stack = ", ".join(data.get("techStack") or []) or "-"
+    return "\n".join(
+        [
+            title,
+            f"- Slug: {data['slug']}",
+            f"- Title: {data['title']}",
+            f"- Summary: {data['summary']}",
+            f"- Status: {data['status']}",
+            f"- Featured: {'Ya' if data['featured'] else 'Tidak'}",
+            f"- Tech Stack: {tech_stack}",
+            f"- Repo URL: {data['repoUrl'] or '-'}",
+            f"- Demo URL: {data['demoUrl'] or '-'}",
+            "",
+            "Description:",
+            data["description"] or "-",
+        ]
+    )
+
+
+def format_profile_review(profile: Dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "Draft profile:",
+            f"- Name: {profile.get('name') or '-'}",
+            f"- Role: {profile.get('role') or '-'}",
+            f"- Headline: {profile.get('headline') or '-'}",
+            f"- Location: {profile.get('location') or '-'}",
+            f"- Email: {profile.get('email') or '-'}",
+            "",
+            "Bio:",
+            str(profile.get("bio") or "-"),
+        ]
+    )
+
+
+def format_social_review(social_links: Dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "Draft social links:",
+            f"- GitHub: {social_links.get('githubUrl') or '-'}",
+            f"- LinkedIn: {social_links.get('linkedinUrl') or '-'}",
+            f"- WhatsApp: {social_links.get('telegramUrl') or '-'}",
+            f"- Portfolio: {social_links.get('portfolioUrl') or '-'}",
+        ]
+    )
+
+
+def format_field_menu(title: str, options: List[Tuple[str, str]], save_hint: str) -> str:
+    lines = [title, ""]
+    for index, (_, label) in enumerate(options, start=1):
+        lines.append(f"{index}. {label}")
+    lines.extend(["", save_hint, "Perintah: nomor field | save | back | menu | cancel"])
+    return "\n".join(lines)
+
+
+def resolve_field_choice(value: str, options: List[Tuple[str, str]]) -> Optional[str]:
+    normalized = value.strip().lower()
+    if normalized.isdigit():
+        index = int(normalized) - 1
+        if 0 <= index < len(options):
+            return options[index][0]
+    for key, label in options:
+        if normalized in {key, label.lower()}:
+            return key
+    return None
+
+
+def format_project_selection(projects: List[Dict[str, Any]], title: str) -> str:
+    return f"{title}\n\n{format_portfolio_projects(projects)}\n\nKirim nomor atau slug project. Pakai back/menu/cancel kalau mau batal."
+
+
+def resolve_project_choice(value: str, projects: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    normalized = value.strip()
+    if normalized.isdigit():
+        index = int(normalized) - 1
+        if 0 <= index < len(projects):
+            return dict(projects[index])
+    normalized_slug = normalized.lower()
+    for project in projects:
+        if str(project.get("slug") or "").lower() == normalized_slug:
+            return dict(project)
+    return None
+
+
+def add_project_prompt(step: str) -> str:
+    prompts = {
+        "title": "Tambah project.\nKirim title project.",
+        "slug": "Kirim slug project.\nFormat: lowercase-hyphen, contoh `market-bot`.",
+        "summary": "Kirim summary singkat project.",
+        "status": "Pilih status project:\n1. live\n2. wip\n3. private\n4. archived",
+        "featured": "Featured project?\nKetik: yes / no",
+        "tech": "Kirim tech stack dipisah koma.\nContoh: Python, Telegram Bot API, Docker",
+        "description": "Kirim description project. Boleh multi-line.",
+    }
+    return prompts.get(step, "Lanjutkan isi draft project.")
+
+
+def update_project_field(project: Dict[str, Any], field: str, value: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    data = normalize_portfolio_project(project)
+    field = field.lower().strip()
+    cleaned = value.strip()
+
+    if field == "title":
+        if not cleaned:
+            return None, "Title tidak boleh kosong."
+        data["title"] = cleaned
+    elif field == "summary":
+        if not cleaned:
+            return None, "Summary tidak boleh kosong."
+        data["summary"] = cleaned
+    elif field == "status":
+        status = parse_project_status_choice(cleaned)
+        if not status:
+            return None, "Status tidak valid. Pilih: 1 live, 2 wip, 3 private, 4 archived."
+        data["status"] = status
+    elif field == "featured":
+        featured = parse_boolean_choice(cleaned)
+        if featured is None:
+            return None, "Featured tidak valid. Pakai yes/no."
+        data["featured"] = featured
+    elif field == "tech":
+        tech_stack = [item.strip() for item in cleaned.split(",") if item.strip()]
+        if not tech_stack:
+            return None, "Tech stack tidak boleh kosong."
+        data["techStack"] = tech_stack
+    elif field == "description":
+        if not cleaned:
+            return None, "Description tidak boleh kosong."
+        data["description"] = cleaned
+    elif field == "repo":
+        data["repoUrl"] = "" if cleaned.lower() in {"-", "kosong", "clear"} else cleaned
+    elif field == "demo":
+        data["demoUrl"] = "" if cleaned.lower() in {"-", "kosong", "clear"} else cleaned
+    else:
+        return None, "Field project tidak dikenal."
+
+    return data, None
+
+
+def update_profile_field(profile: Dict[str, Any], field: str, value: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    allowed = {"name", "role", "headline", "bio", "location", "email"}
+    field = field.lower().strip()
+    if field not in allowed:
+        return None, "Field profile tidak dikenal."
+    if not value.strip():
+        return None, "Nilai profile tidak boleh kosong."
+    data = dict(profile)
+    data[field] = value.strip()
+    return data, None
+
+
+def update_social_field(social_links: Dict[str, Any], field: str, value: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    field_map = {
+        "github": "githubUrl",
+        "linkedin": "linkedinUrl",
+        "whatsapp": "telegramUrl",
+        "wa": "telegramUrl",
+        "portfolio": "portfolioUrl",
+    }
+    key = field_map.get(field.lower().strip())
+    if not key:
+        return None, "Field social tidak dikenal."
+    if not value.strip():
+        return None, "Nilai social link tidak boleh kosong."
+    data = dict(social_links)
+    data[key] = value.strip()
+    return data, None
+
+
+def prompt_project_field_value(field: str) -> str:
+    prompts = {
+        "title": "Kirim title baru project.",
+        "summary": "Kirim summary baru project.",
+        "status": "Pilih status baru:\n1. live\n2. wip\n3. private\n4. archived",
+        "featured": "Featured project?\nKetik yes / no",
+        "tech": "Kirim tech stack baru dipisah koma.",
+        "description": "Kirim description baru project.",
+        "repo": "Kirim repo URL baru. Pakai `-` untuk mengosongkan.",
+        "demo": "Kirim demo URL baru. Pakai `-` untuk mengosongkan.",
+    }
+    return prompts.get(field, "Kirim nilai baru.")
+
+
+def prompt_profile_field_value(field: str) -> str:
+    labels = dict(PORTFOLIO_PROFILE_FIELDS)
+    return f"Kirim nilai baru untuk {labels.get(field, field)}."
+
+
+def prompt_social_field_value(field: str) -> str:
+    labels = dict(PORTFOLIO_SOCIAL_FIELDS)
+    return f"Kirim nilai baru untuk {labels.get(field, field)}."
+
+
+def handle_portfolio_back(chat_id: str, session: Dict[str, Any]) -> str:
+    flow = str(session.get("flow") or "menu")
+    step = str(session.get("step") or "menu")
+
+    if flow == "add_project":
+        current_index = PORTFOLIO_ADD_PROJECT_STEPS.index(step)
+        if current_index == 0:
+            reset_portfolio_session(session)
+            save_portfolio_session(chat_id, session)
+            send_portfolio_menu(chat_id, "Kembali ke menu.")
+            return "ok"
+        previous_step = PORTFOLIO_ADD_PROJECT_STEPS[current_index - 1]
+        session["step"] = previous_step
+        save_portfolio_session(chat_id, session)
+        send_text(chat_id, add_project_prompt(previous_step))
+        return "ok"
+
+    if flow == "edit_project":
+        if step == "field_value":
+            session["step"] = "field_menu"
+            session.pop("selected_field", None)
+            save_portfolio_session(chat_id, session)
+            send_text(
+                chat_id,
+                format_portfolio_project_review(dict(session.get("draft") or {}), "Draft edit project:")
+                + "\n\n"
+                + format_field_menu(
+                    "Pilih field project yang mau diubah:",
+                    PORTFOLIO_PROJECT_FIELDS,
+                    "Ketik save untuk menyimpan perubahan project.",
+                ),
+            )
+            return "ok"
+        if step == "field_menu":
+            session["step"] = "select_project"
+            save_portfolio_session(chat_id, session)
+            send_text(chat_id, format_project_selection(list(session.get("project_choices") or []), "Pilih project yang mau diedit:"))
+            return "ok"
+
+    if flow == "delete_project" and step == "confirm":
+        session["step"] = "select_project"
+        save_portfolio_session(chat_id, session)
+        send_text(chat_id, format_project_selection(list(session.get("project_choices") or []), "Pilih project yang mau dihapus:"))
+        return "ok"
+
+    if flow in {"edit_profile", "edit_social"}:
+        if step == "field_value":
+            session["step"] = "field_menu"
+            session.pop("selected_field", None)
+            save_portfolio_session(chat_id, session)
+            if flow == "edit_profile":
+                send_text(
+                    chat_id,
+                    format_profile_review(dict(session.get("draft") or {}))
+                    + "\n\n"
+                    + format_field_menu(
+                        "Pilih field profile yang mau diubah:",
+                        PORTFOLIO_PROFILE_FIELDS,
+                        "Ketik save untuk menyimpan perubahan profile.",
+                    ),
+                )
+            else:
+                send_text(
+                    chat_id,
+                    format_social_review(dict(session.get("draft") or {}))
+                    + "\n\n"
+                    + format_field_menu(
+                        "Pilih field social links yang mau diubah:",
+                        PORTFOLIO_SOCIAL_FIELDS,
+                        "Ketik save untuk menyimpan perubahan social links.",
+                    ),
+                )
+            return "ok"
+
+    reset_portfolio_session(session)
+    save_portfolio_session(chat_id, session)
+    send_portfolio_menu(chat_id, "Kembali ke menu.")
+    return "ok"
+
+
+def start_portfolio_add_project(chat_id: str, session: Dict[str, Any]) -> str:
+    session["flow"] = "add_project"
+    session["step"] = "title"
+    session["draft"] = {
+        "title": "",
+        "slug": "",
+        "summary": "",
+        "status": "wip",
+        "featured": False,
+        "techStack": [],
+        "description": "",
+        "repoUrl": "",
+        "demoUrl": "",
+    }
+    save_portfolio_session(chat_id, session)
+    send_text(chat_id, add_project_prompt("title"))
+    return "ok"
+
+
+def start_portfolio_project_selection(chat_id: str, session: Dict[str, Any], flow: str, title: str) -> str:
+    snapshot, error = portfolio_snapshot()
+    projects = list((snapshot or {}).get("projects") or [])
+    if error:
+        send_text(chat_id, f"Gagal mengambil project: {error}")
+        return "error"
+    if not projects:
+        reset_portfolio_session(session)
+        save_portfolio_session(chat_id, session)
+        send_portfolio_menu(chat_id, "Belum ada project di portfolio.")
+        return "ok"
+
+    session["flow"] = flow
+    session["step"] = "select_project"
+    session["project_choices"] = projects
+    save_portfolio_session(chat_id, session)
+    send_text(chat_id, format_project_selection(projects, title))
+    return "ok"
+
+
+def start_portfolio_edit_profile(chat_id: str, session: Dict[str, Any]) -> str:
+    snapshot, error = portfolio_snapshot()
+    if error or not snapshot:
+        send_text(chat_id, f"Gagal mengambil profile: {error}")
+        return "error"
+
+    session["flow"] = "edit_profile"
+    session["step"] = "field_menu"
+    session["draft"] = dict(snapshot.get("profile") or {})
+    save_portfolio_session(chat_id, session)
+    send_text(
+        chat_id,
+        format_profile_review(dict(session.get("draft") or {}))
+        + "\n\n"
+        + format_field_menu(
+            "Pilih field profile yang mau diubah:",
+            PORTFOLIO_PROFILE_FIELDS,
+            "Ketik save untuk menyimpan perubahan profile.",
+        ),
+    )
+    return "ok"
+
+
+def start_portfolio_edit_social(chat_id: str, session: Dict[str, Any]) -> str:
+    snapshot, error = portfolio_snapshot()
+    if error or not snapshot:
+        send_text(chat_id, f"Gagal mengambil social links: {error}")
+        return "error"
+
+    session["flow"] = "edit_social"
+    session["step"] = "field_menu"
+    session["draft"] = dict(snapshot.get("socialLinks") or {})
+    save_portfolio_session(chat_id, session)
+    send_text(
+        chat_id,
+        format_social_review(dict(session.get("draft") or {}))
+        + "\n\n"
+        + format_field_menu(
+            "Pilih field social links yang mau diubah:",
+            PORTFOLIO_SOCIAL_FIELDS,
+            "Ketik save untuk menyimpan perubahan social links.",
+        ),
+    )
+    return "ok"
+
+
+def handle_portfolio_menu(chat_id: str, session: Dict[str, Any], lower: str) -> str:
+    action = portfolio_action_from_input(lower)
+    if not action:
+        send_portfolio_menu(chat_id, "Pilihan !porto tidak dikenal.")
+        return "ok"
+
+    if action == "list_projects":
+        snapshot, error = portfolio_snapshot()
+        if error or not snapshot:
+            send_text(chat_id, f"Gagal mengambil portfolio: {error}")
+            return "error"
+        send_portfolio_menu(chat_id, format_portfolio_projects(list(snapshot.get("projects") or [])))
+        return "ok"
+    if action == "add_project":
+        return start_portfolio_add_project(chat_id, session)
+    if action == "edit_project":
+        return start_portfolio_project_selection(chat_id, session, "edit_project", "Pilih project yang mau diedit:")
+    if action == "delete_project":
+        return start_portfolio_project_selection(chat_id, session, "delete_project", "Pilih project yang mau dihapus:")
+    if action == "edit_profile":
+        return start_portfolio_edit_profile(chat_id, session)
+    if action == "edit_social":
+        return start_portfolio_edit_social(chat_id, session)
+    return "ok"
+
+
+def handle_portfolio_add_project(chat_id: str, session: Dict[str, Any], user_text: str) -> str:
+    draft = dict(session.get("draft") or {})
+    step = str(session.get("step") or "title")
+    cleaned = user_text.strip()
+
+    if step == "title":
+        if not cleaned:
+            send_text(chat_id, "Title tidak boleh kosong.")
+            return "ok"
+        draft["title"] = cleaned
+        session["step"] = "slug"
+    elif step == "slug":
+        slug = normalize_project_slug(cleaned)
+        if not slug:
+            send_text(chat_id, "Slug tidak valid. Pakai lowercase-hyphen, contoh `market-bot`.")
+            return "ok"
+        draft["slug"] = slug
+        session["step"] = "summary"
+    elif step == "summary":
+        if not cleaned:
+            send_text(chat_id, "Summary tidak boleh kosong.")
+            return "ok"
+        draft["summary"] = cleaned
+        session["step"] = "status"
+    elif step == "status":
+        status = parse_project_status_choice(cleaned)
+        if not status:
+            send_text(chat_id, "Status tidak valid. Pilih: 1 live, 2 wip, 3 private, 4 archived.")
+            return "ok"
+        draft["status"] = status
+        session["step"] = "featured"
+    elif step == "featured":
+        featured = parse_boolean_choice(cleaned)
+        if featured is None:
+            send_text(chat_id, "Featured tidak valid. Ketik yes / no.")
+            return "ok"
+        draft["featured"] = featured
+        session["step"] = "tech"
+    elif step == "tech":
+        tech_stack = [item.strip() for item in cleaned.split(",") if item.strip()]
+        if not tech_stack:
+            send_text(chat_id, "Tech stack tidak boleh kosong.")
+            return "ok"
+        draft["techStack"] = tech_stack
+        session["step"] = "description"
+    elif step == "description":
+        if not cleaned:
+            send_text(chat_id, "Description tidak boleh kosong.")
+            return "ok"
+        draft["description"] = cleaned
+        session["step"] = "review"
+    elif step == "review":
+        if cleaned.lower() != "save":
+            send_text(chat_id, "Ketik save untuk membuat project, atau back/menu/cancel.")
+            return "ok"
+        _, api_error = portfolio_api_request("POST", "/api/admin/projects", draft)
+        if api_error:
+            send_text(chat_id, f"Gagal membuat project: {api_error}")
+            return "error"
+        reset_portfolio_session(session)
+        save_portfolio_session(chat_id, session)
+        send_portfolio_menu(chat_id, f"Project berhasil dibuat: {draft.get('slug')}")
+        return "ok"
+
+    session["draft"] = draft
+    save_portfolio_session(chat_id, session)
+
+    if session.get("step") == "review":
+        send_text(
+            chat_id,
+            format_portfolio_project_review(draft, "Review project baru:")
+            + "\n\nKetik save untuk menyimpan, back untuk revisi, atau menu/cancel.",
+        )
+        return "ok"
+
+    send_text(chat_id, add_project_prompt(str(session.get("step"))))
+    return "ok"
+
+
+def handle_portfolio_edit_project(chat_id: str, session: Dict[str, Any], user_text: str) -> str:
+    step = str(session.get("step") or "select_project")
+    cleaned = user_text.strip()
+
+    if step == "select_project":
+        project = resolve_project_choice(cleaned, list(session.get("project_choices") or []))
+        if not project:
+            send_text(chat_id, "Project tidak ditemukan. Kirim nomor atau slug yang valid.")
+            return "ok"
+        session["selected_slug"] = str(project.get("slug") or "")
+        session["draft"] = normalize_portfolio_project(project)
+        session["step"] = "field_menu"
+        save_portfolio_session(chat_id, session)
+        send_text(
+            chat_id,
+            format_portfolio_project_review(dict(session.get("draft") or {}), "Draft edit project:")
+            + "\n\n"
+            + format_field_menu(
+                "Pilih field project yang mau diubah:",
+                PORTFOLIO_PROJECT_FIELDS,
+                "Ketik save untuk menyimpan perubahan project.",
+            ),
+        )
+        return "ok"
+
+    if step == "field_menu":
+        if cleaned.lower() == "save":
+            selected_slug = str(session.get("selected_slug") or "")
+            draft = dict(session.get("draft") or {})
+            _, api_error = portfolio_api_request("PUT", f"/api/admin/projects/{selected_slug}", draft)
+            if api_error:
+                send_text(chat_id, f"Gagal update project: {api_error}")
+                return "error"
+            reset_portfolio_session(session)
+            save_portfolio_session(chat_id, session)
+            send_portfolio_menu(chat_id, f"Project berhasil diupdate: {selected_slug}")
+            return "ok"
+
+        field = resolve_field_choice(cleaned, PORTFOLIO_PROJECT_FIELDS)
+        if not field:
+            send_text(
+                chat_id,
+                format_field_menu(
+                    "Pilihan field project tidak dikenal.",
+                    PORTFOLIO_PROJECT_FIELDS,
+                    "Ketik save untuk menyimpan perubahan project.",
+                ),
+            )
+            return "ok"
+        session["selected_field"] = field
+        session["step"] = "field_value"
+        save_portfolio_session(chat_id, session)
+        send_text(chat_id, prompt_project_field_value(field))
+        return "ok"
+
+    field = str(session.get("selected_field") or "")
+    draft = dict(session.get("draft") or {})
+    payload, field_error = update_project_field(draft, field, cleaned)
+    if field_error or not payload:
+        send_text(chat_id, field_error or "Nilai project tidak valid.")
+        return "ok"
+
+    session["draft"] = payload
+    session["step"] = "field_menu"
+    session.pop("selected_field", None)
+    save_portfolio_session(chat_id, session)
+    send_text(
+        chat_id,
+        format_portfolio_project_review(payload, "Draft edit project:")
+        + "\n\n"
+        + format_field_menu(
+            "Pilih field project yang mau diubah:",
+            PORTFOLIO_PROJECT_FIELDS,
+            "Ketik save untuk menyimpan perubahan project.",
+        ),
+    )
+    return "ok"
+
+
+def handle_portfolio_delete_project(chat_id: str, session: Dict[str, Any], user_text: str) -> str:
+    step = str(session.get("step") or "select_project")
+    cleaned = user_text.strip()
+
+    if step == "select_project":
+        project = resolve_project_choice(cleaned, list(session.get("project_choices") or []))
+        if not project:
+            send_text(chat_id, "Project tidak ditemukan. Kirim nomor atau slug yang valid.")
+            return "ok"
+        session["selected_slug"] = str(project.get("slug") or "")
+        session["selected_project"] = project
+        session["step"] = "confirm"
+        save_portfolio_session(chat_id, session)
+        send_text(
+            chat_id,
+            format_portfolio_project_review(project, "Project yang akan dihapus:")
+            + "\n\nKetik yes untuk hapus permanen, atau back/menu/cancel.",
+        )
+        return "ok"
+
+    normalized = cleaned.lower()
+    if normalized not in {"yes", "ya"}:
+        send_text(chat_id, "Ketik yes untuk hapus permanen, atau back/menu/cancel.")
+        return "ok"
+
+    selected_slug = str(session.get("selected_slug") or "")
+    _, api_error = portfolio_api_request("DELETE", f"/api/admin/projects/{selected_slug}")
+    if api_error:
+        send_text(chat_id, f"Gagal hapus project: {api_error}")
+        return "error"
+    reset_portfolio_session(session)
+    save_portfolio_session(chat_id, session)
+    send_portfolio_menu(chat_id, f"Project berhasil dihapus: {selected_slug}")
+    return "ok"
+
+
+def handle_portfolio_edit_profile(chat_id: str, session: Dict[str, Any], user_text: str) -> str:
+    step = str(session.get("step") or "field_menu")
+    cleaned = user_text.strip()
+
+    if step == "field_menu":
+        if cleaned.lower() == "save":
+            draft = dict(session.get("draft") or {})
+            _, api_error = portfolio_api_request("PUT", "/api/admin/profile", draft)
+            if api_error:
+                send_text(chat_id, f"Gagal update profile: {api_error}")
+                return "error"
+            reset_portfolio_session(session)
+            save_portfolio_session(chat_id, session)
+            send_portfolio_menu(chat_id, "Profile berhasil diupdate.")
+            return "ok"
+
+        field = resolve_field_choice(cleaned, PORTFOLIO_PROFILE_FIELDS)
+        if not field:
+            send_text(
+                chat_id,
+                format_field_menu(
+                    "Pilihan field profile tidak dikenal.",
+                    PORTFOLIO_PROFILE_FIELDS,
+                    "Ketik save untuk menyimpan perubahan profile.",
+                ),
+            )
+            return "ok"
+        session["selected_field"] = field
+        session["step"] = "field_value"
+        save_portfolio_session(chat_id, session)
+        send_text(chat_id, prompt_profile_field_value(field))
+        return "ok"
+
+    field = str(session.get("selected_field") or "")
+    draft = dict(session.get("draft") or {})
+    payload, field_error = update_profile_field(draft, field, cleaned)
+    if field_error or not payload:
+        send_text(chat_id, field_error or "Nilai profile tidak valid.")
+        return "ok"
+
+    session["draft"] = payload
+    session["step"] = "field_menu"
+    session.pop("selected_field", None)
+    save_portfolio_session(chat_id, session)
+    send_text(
+        chat_id,
+        format_profile_review(payload)
+        + "\n\n"
+        + format_field_menu(
+            "Pilih field profile yang mau diubah:",
+            PORTFOLIO_PROFILE_FIELDS,
+            "Ketik save untuk menyimpan perubahan profile.",
+        ),
+    )
+    return "ok"
+
+
+def handle_portfolio_edit_social(chat_id: str, session: Dict[str, Any], user_text: str) -> str:
+    step = str(session.get("step") or "field_menu")
+    cleaned = user_text.strip()
+
+    if step == "field_menu":
+        if cleaned.lower() == "save":
+            draft = dict(session.get("draft") or {})
+            _, api_error = portfolio_api_request("PUT", "/api/admin/social-links", draft)
+            if api_error:
+                send_text(chat_id, f"Gagal update social links: {api_error}")
+                return "error"
+            reset_portfolio_session(session)
+            save_portfolio_session(chat_id, session)
+            send_portfolio_menu(chat_id, "Social links berhasil diupdate.")
+            return "ok"
+
+        field = resolve_field_choice(cleaned, PORTFOLIO_SOCIAL_FIELDS)
+        if not field:
+            send_text(
+                chat_id,
+                format_field_menu(
+                    "Pilihan field social links tidak dikenal.",
+                    PORTFOLIO_SOCIAL_FIELDS,
+                    "Ketik save untuk menyimpan perubahan social links.",
+                ),
+            )
+            return "ok"
+        session["selected_field"] = field
+        session["step"] = "field_value"
+        save_portfolio_session(chat_id, session)
+        send_text(chat_id, prompt_social_field_value(field))
+        return "ok"
+
+    field = str(session.get("selected_field") or "")
+    draft = dict(session.get("draft") or {})
+    payload, field_error = update_social_field(draft, field, cleaned)
+    if field_error or not payload:
+        send_text(chat_id, field_error or "Nilai social links tidak valid.")
+        return "ok"
+
+    session["draft"] = payload
+    session["step"] = "field_menu"
+    session.pop("selected_field", None)
+    save_portfolio_session(chat_id, session)
+    send_text(
+        chat_id,
+        format_social_review(payload)
+        + "\n\n"
+        + format_field_menu(
+            "Pilih field social links yang mau diubah:",
+            PORTFOLIO_SOCIAL_FIELDS,
+            "Ketik save untuk menyimpan perubahan social links.",
+        ),
+    )
+    return "ok"
+
+
+def handle_portfolio_session_input(chat_id: str, text: Optional[str]) -> str:
+    session = get_portfolio_session(chat_id)
+    if not session:
+        return "ignored"
+
+    user_text = (text or "").strip()
+    lower = user_text.lower()
+
+    if lower in {"", "help", "menu", "!porto"}:
+        reset_portfolio_session(session)
+        save_portfolio_session(chat_id, session)
+        send_portfolio_menu(chat_id)
+        return "ok"
+
+    if lower in {"0", "exit", "keluar"}:
+        clear_portfolio_session(chat_id)
+        send_text(chat_id, "Sesi !porto ditutup.")
+        return "ok"
+
+    if lower in {"cancel", "batal"}:
+        reset_portfolio_session(session)
+        save_portfolio_session(chat_id, session)
+        send_portfolio_menu(chat_id, "Flow !porto dibatalkan.")
+        return "ok"
+
+    if lower == "back":
+        return handle_portfolio_back(chat_id, session)
+
+    flow = str(session.get("flow") or "menu")
+
+    if flow == "menu":
+        return handle_portfolio_menu(chat_id, session, lower)
+    if flow == "add_project":
+        return handle_portfolio_add_project(chat_id, session, user_text)
+    if flow == "edit_project":
+        return handle_portfolio_edit_project(chat_id, session, user_text)
+    if flow == "delete_project":
+        return handle_portfolio_delete_project(chat_id, session, user_text)
+    if flow == "edit_profile":
+        return handle_portfolio_edit_profile(chat_id, session, user_text)
+    if flow == "edit_social":
+        return handle_portfolio_edit_social(chat_id, session, user_text)
+
+    reset_portfolio_session(session)
+    save_portfolio_session(chat_id, session)
+    send_portfolio_menu(chat_id, "State !porto tidak dikenal. Kembali ke menu.")
+    return "ok"
+
+
+def handle_portfolio_command(chat_id: str, command: Optional[str], text: Optional[str]) -> str:
+    if command == "porto":
+        if get_post_draft(chat_id) or get_logbook_session(chat_id):
+            send_text(chat_id, "Selesaikan sesi !post atau !logbook dulu sebelum membuka !porto.")
+            return "ok"
+        if not is_portfolio_chat_allowed(chat_id):
+            logger.warning("Portfolio access denied for chat_id=%s", chat_id)
+            send_text(chat_id, "Kamu tidak diizinkan memakai fitur portfolio ini.")
+            return "ok"
+        if not PORTFOLIO_API_BASE_URL or not PORTFOLIO_API_SECRET:
+            send_text(chat_id, "Konfigurasi portfolio belum lengkap. Set PORTFOLIO_API_BASE_URL dan PORTFOLIO_API_SECRET.")
+            return "error"
+        session = {"status": "active", "flow": "menu", "step": "menu"}
+        save_portfolio_session(chat_id, session)
+        send_portfolio_menu(chat_id)
+        return "ok"
+
+    if not get_portfolio_session(chat_id):
+        return "ignored"
+
+    return handle_portfolio_session_input(chat_id, text)
+
+
 def rate_limit_ok(chat_id: str) -> Tuple[bool, int]:
     now = time.time()
     last = rate_limit.get(chat_id)
@@ -897,153 +1886,9 @@ def rate_limit_ok(chat_id: str) -> Tuple[bool, int]:
     return True, 0
 
 
-def send_text(chat_id: str, text: str) -> None:
-    footer = "© Haris Stockbit"
-    if text and not text.rstrip().endswith(footer):
-        text = f"{text.rstrip()}\n\n{footer}"
-    url = f"{WAHA_BASE_URL}/api/sendText"
-    payload = {"chatId": chat_id, "text": text, "session": WAHA_SESSION}
-    headers = {"Content-Type": "application/json"}
-    if WAHA_API_KEY:
-        headers["X-API-Key"] = WAHA_API_KEY
-        headers["Authorization"] = f"Bearer {WAHA_API_KEY}"
-    try:
-        response = http_session.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
-        if response.status_code >= 400:
-            logger.error("WAHA sendText failed: %s %s", response.status_code, response.text)
-    except Exception as exc:
-        logger.exception("WAHA sendText error: %s", exc)
-
-
-def _rewrite_waha_media_url(url: str) -> str:
-    """Replace the host/port in a WAHA media URL with WAHA_BASE_URL.
-
-    WAHA webhook payloads include media.url like:
-        http://localhost:3000/api/default/download/...
-    But the bot may reach WAHA via a different host (e.g., http://waha:3000 in Docker).
-    This replaces the origin so the URL is always reachable from the bot.
-    """
-    if not url or not WAHA_BASE_URL:
-        return url
-    try:
-        from urllib.parse import urlparse, urlunparse
-        parsed_media = urlparse(url)
-        parsed_base = urlparse(WAHA_BASE_URL)
-        rewritten = urlunparse(parsed_media._replace(
-            scheme=parsed_base.scheme,
-            netloc=parsed_base.netloc,
-        ))
-        if rewritten != url:
-            logger.debug("_rewrite_waha_media_url: %s → %s", url, rewritten)
-        return rewritten
-    except Exception:
-        return url
-
-
-def _get_waha_headers() -> Dict[str, str]:
-
-    headers: Dict[str, str] = {}
-    if WAHA_API_KEY:
-        headers["X-API-Key"] = WAHA_API_KEY
-        headers["Authorization"] = f"Bearer {WAHA_API_KEY}"
-    return headers
-
-
-def download_waha_media(url: str) -> Optional[bytes]:
-    """Download media bytes from a WAHA media URL."""
-    if not url:
-        return None
-    try:
-        resp = requests.get(url, headers=_get_waha_headers(), timeout=HTTP_TIMEOUT)
-        if resp.status_code == 200:
-            return resp.content
-        logger.error("download_waha_media failed: HTTP %s url=%s", resp.status_code, url)
-    except requests.exceptions.RequestException as exc:
-        logger.error("download_waha_media error: %s url=%s", exc, url)
-    return None
-
-
-def fetch_media_bytes(media: Dict[str, Any]) -> Optional[bytes]:
-    """Get file bytes from a WAHA media dict.
-
-    Tries in order:
-    1. Base64 'data' field (most reliable, already in payload)
-    2. Direct URL download
-    3. WAHA GET /api/{session}/media/{messageId} (WAHA Plus)
-    4. WAHA POST downloadMedia endpoint
-    """
-    import base64
-
-    # 1. Try base64 data field (WAHA often includes this)
-    data_b64 = media.get("data")
-    if data_b64 and isinstance(data_b64, str):
-        # Strip data URI prefix if present: "data:image/jpeg;base64,/9j..."
-        b64_str = data_b64.split(",", 1)[1] if "," in data_b64 else data_b64
-        try:
-            decoded = base64.b64decode(b64_str)
-            if decoded:
-                logger.info("fetch_media_bytes: got %d bytes from base64 data", len(decoded))
-                return decoded
-        except Exception as exc:
-            logger.warning("fetch_media_bytes base64 decode failed: %s", exc)
-
-    url = media.get("url")
-    if url:
-        url = _rewrite_waha_media_url(str(url))
-
-    # 2. Direct URL download
-    if url:
-        logger.info("fetch_media_bytes: trying direct URL: %s", url)
-        result = download_waha_media(url)
-        if result:
-            logger.info("fetch_media_bytes: got %d bytes from URL", len(result))
-            return result
-
-    # 3. WAHA GET media by messageId (WAHA Plus / some newer versions)
-    msg_id = media.get("messageId")
-    if msg_id:
-        for endpoint in [
-            f"{WAHA_BASE_URL}/api/{WAHA_SESSION}/messages/{msg_id}/download",
-            f"{WAHA_BASE_URL}/api/{WAHA_SESSION}/messages/{msg_id}/media",
-        ]:
-            try:
-                resp = requests.get(endpoint, headers=_get_waha_headers(), timeout=HTTP_TIMEOUT)
-                if resp.status_code == 200 and resp.content:
-                    logger.info("fetch_media_bytes: got %d bytes via messageId endpoint %s", len(resp.content), endpoint)
-                    return resp.content
-                logger.debug("fetch_media_bytes messageId endpoint %s → HTTP %s", endpoint, resp.status_code)
-            except requests.exceptions.RequestException as exc:
-                logger.debug("fetch_media_bytes messageId endpoint %s error: %s", endpoint, exc)
-
-    # 4. WAHA POST /api/{session}/messages/download endpoint
-    if url:
-        try:
-            dl_url = f"{WAHA_BASE_URL}/api/{WAHA_SESSION}/messages/download"
-            resp = requests.post(
-                dl_url,
-                json={"url": url},
-                headers={**_get_waha_headers(), "Content-Type": "application/json"},
-                timeout=HTTP_TIMEOUT,
-            )
-            if resp.status_code == 200 and resp.content:
-                logger.info("fetch_media_bytes: got %d bytes from WAHA POST downloadMedia", len(resp.content))
-                return resp.content
-            logger.warning("fetch_media_bytes WAHA POST downloadMedia → HTTP %s", resp.status_code)
-        except requests.exceptions.RequestException as exc:
-            logger.warning("fetch_media_bytes WAHA POST downloadMedia error: %s", exc)
-
-    logger.warning(
-        "fetch_media_bytes: all strategies failed. url=%s has_data=%s msg_id=%s",
-        url, bool(data_b64), msg_id,
-    )
-    return None
-
-
-
 def sanitize_debug_error(error: Optional[str], limit: int = 300) -> str:
     if not error:
         return "Tidak ada detail error."
-    # Hide any accidental key-like token in error text.
     masked = re.sub(r"(sk-[A-Za-z0-9_-]{10,}|gsk_[A-Za-z0-9_-]{10,}|nvapi-[A-Za-z0-9_-]{10,})", "***", error)
     masked = re.sub(r"\s+", " ", masked).strip()
     if len(masked) > limit:
@@ -1142,13 +1987,12 @@ def format_quote_text(
     open_price = data.get("open")
     change = data.get("change")
     pct = data.get("pct_change")
-    
-    # Calculate change if not provided
+
     if change is None and close is not None and open_price is not None:
         change = close - open_price
     if pct is None and change is not None and open_price not in (None, 0):
         pct = (change / open_price) * 100
-    
+
     header = display if display else f"{symbol} (IDX)"
     lines = [
         header,
@@ -1157,10 +2001,10 @@ def format_quote_text(
         f"O/H/L: {format_number(data.get('open'))} / {format_number(data.get('high'))} / {format_number(data.get('low'))}",
         f"Volume: {format_number(data.get('volume'))}",
     ]
-    
+
     if data.get("date"):
         lines.append(f"Time: {format_time_wib(data.get('date'))}")
-    
+
     if sr:
         lines.append("")
         lines.extend(
@@ -1226,144 +2070,128 @@ def help_text() -> str:
             "10) Publish draft LinkedIn: !postok / batal: !cancelpost",
             "11) Mode logbook KP: !logbook",
             "12) Submit/cancel/update logbook: !ok / !cancel / !update",
+            "13) Mode CRUD portfolio: !porto",
             "",
             "Catatan:",
+            "- Bot ini dipakai lewat private chat Telegram",
             "- Data harga saham & IHSG via TradingView (tvDatafeed)",
             "- Berita dari Google News RSS",
             "- Output S/R berbasis pivot harian",
             "- AI chat umum via !ai, mentor backend via !explain, berita via !news",
             f"- LinkedIn post support caption + 1-{LINKEDIN_MAX_IMAGES} gambar",
             "- Logbook mode: isi materi manual, lalu konfirmasi submit ke MIS",
+            "- Portfolio mode: edit data website lewat API portfolio",
         ]
     )
 
 
-@app.route("/health", methods=["GET"])
-def health() -> str:
-    return "ok"
+def process_incoming_message(
+    text: Optional[str],
+    chat_id: Optional[str],
+    from_me: bool,
+    media: Optional[Dict[str, Any]],
+    chat_type: Optional[str],
+) -> str:
+    if not chat_id or from_me or chat_type != "private":
+        return "ignored"
 
-
-@app.route("/webhook", methods=["POST"])
-def webhook() -> Any:
-    payload = request.get_json(silent=True) or {}
-    text, chat_id, from_me, media = extract_message(payload)
-
-    if not chat_id or from_me:
-        return jsonify({"status": "ignored"})
+    if media and media.get("error"):
+        send_text(chat_id, str(media.get("error")))
+        return "error"
 
     command, symbol = parse_command(text) if text else (None, None)
+
+    if command == "porto" or get_portfolio_session(chat_id):
+        ok, remaining = rate_limit_ok(chat_id)
+        if not ok:
+            send_text(chat_id, f"Mohon tunggu {remaining} detik sebelum request lagi.")
+            return "rate_limited"
+        return handle_portfolio_command(chat_id, command, text)
 
     if is_logbook_command(command):
         ok, remaining = rate_limit_ok(chat_id)
         if not ok:
             send_text(chat_id, f"Mohon tunggu {remaining} detik sebelum request lagi.")
-            return jsonify({"status": "rate_limited"})
-        status = handle_logbook_command(chat_id, str(command))
-        return jsonify({"status": status})
+            return "rate_limited"
+        return handle_logbook_command(chat_id, str(command))
 
-    if get_logbook_session(chat_id):
-        session = get_logbook_session(chat_id)
-
-        # --- State: awaiting_file (after successful logbook submit) ---
-        if session and session.get("status") == "awaiting_file" and media:
-            # Log raw media payload to diagnose download issues
-            import json as _json
-            logger.info(
-                "WAHA media payload (awaiting_file): mimetype=%s filename=%s url=%s "
-                "has_data=%s data_len=%s messageId=%s",
-                media.get("mimetype"), media.get("filename"), media.get("url"),
-                bool(media.get("data")), len(str(media.get("data") or "")),
-                media.get("messageId"),
-            )
-            try:
-                with open("/tmp/waha_media_debug.json", "w") as _f:
-                    _json.dump(payload, _f, indent=2, default=str)
-            except Exception:
-                pass
-
-        if session and session.get("status") == "awaiting_file":
+    session = get_logbook_session(chat_id)
+    if session:
+        if session.get("status") == "awaiting_file":
             if media and handle_logbook_file_upload(chat_id, media):
-                return jsonify({"status": "ok"})
-            if command == "logbook_skip":
-                # already handled above via is_logbook_command, but guard here too
-                pass
+                return "ok"
             if not media and not command:
                 send_text(
                     chat_id,
                     "Kirim file PDF (laporan) atau foto JPG/JPEG (foto kegiatan), atau ketik !skip untuk selesai.",
                 )
-                return jsonify({"status": "logbook_file_waiting"})
+                return "logbook_file_waiting"
             if command and command != "logbook_skip":
                 send_text(
                     chat_id,
                     "Kamu masih di mode unggah file logbook. Kirim file atau ketik !skip untuk selesai.",
                 )
-                return jsonify({"status": "logbook_file_waiting"})
-
-        # --- State: awaiting_material / awaiting_confirmation ---
+                return "logbook_file_waiting"
         elif command:
             send_text(
                 chat_id,
                 "Kamu masih di mode !logbook. Kirim teks kegiatan/materi, atau pakai !ok / !update / !cancel.",
             )
-            return jsonify({"status": "logbook_mode_waiting"})
+            return "logbook_mode_waiting"
         elif text and handle_logbook_mode_input(chat_id, text):
-            return jsonify({"status": "ok"})
+            return "ok"
         else:
-            return jsonify({"status": "logbook_mode_waiting"})
-
-
+            return "logbook_mode_waiting"
 
     if command in {"post", "postok", "cancelpost", "review"}:
         ok, remaining = rate_limit_ok(chat_id)
         if not ok:
             send_text(chat_id, f"Mohon tunggu {remaining} detik sebelum request lagi.")
-            return jsonify({"status": "rate_limited"})
-        status = handle_post_command(chat_id, command)
-        return jsonify({"status": status})
+            return "rate_limited"
+        return handle_post_command(chat_id, str(command))
 
     if get_post_draft(chat_id) and command:
         send_text(
             chat_id,
             "Kamu masih di mode !post. Kirim caption/gambar, ketik !review untuk cek draft, !postok untuk publish, atau !cancelpost buat batal.",
         )
-        return jsonify({"status": "post_mode_waiting"})
+        return "post_mode_waiting"
 
     if handle_post_mode_input(chat_id, text, media):
-        return jsonify({"status": "ok"})
+        return "ok"
 
     if not text:
-        return jsonify({"status": "ignored"})
+        return "ignored"
 
     if not command:
-        return jsonify({"status": "ignored"})
+        return "ignored"
 
     ok, remaining = rate_limit_ok(chat_id)
     if not ok:
         send_text(chat_id, f"Mohon tunggu {remaining} detik sebelum request lagi.")
-        return jsonify({"status": "rate_limited"})
+        return "rate_limited"
 
     if command == "help":
         send_text(chat_id, help_text())
-        return jsonify({"status": "ok"})
+        return "ok"
 
     if command == "ai":
-        ai_text = re.sub(r"^!ai\\s*", "", text, flags=re.IGNORECASE).strip()
+        ai_text = re.sub(r"^!ai\s*", "", text, flags=re.IGNORECASE).strip()
         if not ai_text:
             send_text(chat_id, "Ketik: !ai <teks>")
-            return jsonify({"status": "ok"})
+            return "ok"
         reply, error = get_ai_reply(chat_id, ai_text)
         if error or not reply:
             send_text(chat_id, "AI lagi error. Coba lagi bentar ya.")
-            return jsonify({"status": "error"})
+            return "error"
         send_text(chat_id, reply)
-        return jsonify({"status": "ok"})
+        return "ok"
 
     if command == "explain":
-        explain_text = re.sub(r"^!explain\\s*", "", text, flags=re.IGNORECASE).strip()
+        explain_text = re.sub(r"^!explain\s*", "", text, flags=re.IGNORECASE).strip()
         if not explain_text:
             send_text(chat_id, "Ketik: !explain <masalah backend yang mau dijelasin>")
-            return jsonify({"status": "ok"})
+            return "ok"
         reply, error = get_backend_savior_reply(chat_id, explain_text)
         if error or not reply:
             if error and "BACKEND_SAVIOR_API_KEY" in error:
@@ -1374,18 +2202,18 @@ def webhook() -> Any:
                     send_text(chat_id, f"Backend Savior lagi error.\nDetail: {detail}")
                 else:
                     send_text(chat_id, "Backend Savior lagi error. Coba lagi bentar ya.")
-            return jsonify({"status": "error"})
+            return "error"
         send_text(chat_id, reply)
-        return jsonify({"status": "ok"})
+        return "ok"
 
     if command == "ihsg":
         data, error = fetch_quote(IHSG_SYMBOL, exchange="IDX")
         if error or data is None:
             send_text(chat_id, error or "Data IHSG tidak tersedia.")
-            return jsonify({"status": "error"})
+            return "error"
         message = format_quote_text(IHSG_SYMBOL, data, display="IHSG (IDX)")
         send_text(chat_id, message)
-        return jsonify({"status": "ok"})
+        return "ok"
 
     if command == "news":
         topic = normalize_news_query(symbol)
@@ -1394,12 +2222,12 @@ def webhook() -> Any:
         if cached:
             message = format_news_text(topic, str(cached.get("summary", "")), list(cached.get("articles", [])))
             send_text(chat_id, message)
-            return jsonify({"status": "ok"})
+            return "ok"
 
         articles, error = fetch_news(topic, limit=NEWS_MAX_ITEMS)
         if error or not articles:
             send_text(chat_id, error or "Belum ada berita yang bisa ditampilkan.")
-            return jsonify({"status": "error"})
+            return "error"
 
         summary, summary_error = summarize_news(topic, articles)
         if summary_error or not summary:
@@ -1415,13 +2243,13 @@ def webhook() -> Any:
 
         message = format_news_text(topic, summary, articles)
         send_text(chat_id, message)
-        return jsonify({"status": "ok"})
+        return "ok"
 
     if command == "quote" and symbol:
         data, error = fetch_quote(symbol, exchange="IDX")
         if error or data is None:
             send_text(chat_id, error or "Data tidak tersedia.")
-            return jsonify({"status": "error"})
+            return "error"
 
         sr_data, sr_error = fetch_sr_levels(symbol, exchange="IDX")
         if sr_error:
@@ -1430,11 +2258,241 @@ def webhook() -> Any:
 
         message = format_quote_text(symbol, data, sr=sr_data)
         send_text(chat_id, message)
-        return jsonify({"status": "ok"})
+        return "ok"
 
-    return jsonify({"status": "ignored"})
+    return "ignored"
+
+
+def telegram_api_request(method: str, payload: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
+    if not TELEGRAM_BOT_TOKEN:
+        return None, "TELEGRAM_BOT_TOKEN belum di-set."
+
+    url = f"{TELEGRAM_API_BASE_URL}/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    request_payload = payload or {}
+    timeout_read = max(HTTP_TIMEOUT, TELEGRAM_POLL_TIMEOUT_SECONDS + 5) if method == "getUpdates" else HTTP_TIMEOUT
+    try:
+        response = http_session.post(
+            url,
+            json=request_payload,
+            timeout=(HTTP_CONNECT_TIMEOUT, timeout_read),
+        )
+    except requests.exceptions.RequestException as exc:
+        return None, f"Telegram {method} request error: {exc}"
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+
+    if response.status_code >= 400 or not body.get("ok", False):
+        description = body.get("description") or response.text[:300]
+        return None, f"Telegram {method} error {response.status_code}: {description}"
+    return body.get("result"), None
+
+
+def build_telegram_file_url(file_path: str) -> str:
+    return f"{TELEGRAM_API_BASE_URL}/file/bot{TELEGRAM_BOT_TOKEN}/{file_path.lstrip('/')}"
+
+
+def guess_mimetype(filename: str, fallback: str) -> str:
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or fallback
+
+
+def download_telegram_media(
+    file_id: str,
+    filename: Optional[str],
+    mimetype: Optional[str],
+    message_id: Optional[int],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    file_info, error = telegram_api_request("getFile", {"file_id": file_id})
+    if error or not isinstance(file_info, dict):
+        return None, error or "Telegram getFile gagal."
+
+    file_path = str(file_info.get("file_path") or "").strip()
+    if not file_path:
+        return None, "Telegram getFile tidak mengembalikan file_path."
+
+    download_url = build_telegram_file_url(file_path)
+    try:
+        response = http_session.get(download_url, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT))
+    except requests.exceptions.RequestException as exc:
+        return None, f"Gagal mengunduh file Telegram: {exc}"
+
+    if response.status_code >= 400:
+        return None, f"Gagal mengunduh file Telegram: HTTP {response.status_code}"
+
+    resolved_filename = (filename or "").strip() or os.path.basename(file_path) or file_id
+    resolved_mimetype = (mimetype or "").strip() or guess_mimetype(resolved_filename, "application/octet-stream")
+    encoded = base64.b64encode(response.content).decode("ascii")
+    return (
+        {
+            "url": None,
+            "mimetype": resolved_mimetype,
+            "filename": resolved_filename,
+            "data": encoded,
+            "messageId": str(message_id or file_id),
+        },
+        None,
+    )
+
+
+def extract_telegram_message(update: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], bool, Optional[Dict[str, Any]], Optional[str]]:
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return None, None, False, None, None
+
+    text = message.get("text") or message.get("caption")
+    chat = message.get("chat") or {}
+    sender = message.get("from") or {}
+    chat_id = normalize_chat_id(chat.get("id"))
+    chat_type = str(chat.get("type") or "").strip() or None
+    from_me = bool(sender.get("is_bot"))
+    message_id = message.get("message_id")
+
+    if from_me or chat_type != "private":
+        return str(text).strip() if isinstance(text, str) else None, chat_id or None, from_me, None, chat_type
+
+    media: Optional[Dict[str, Any]] = None
+    photo_items = message.get("photo")
+    if isinstance(photo_items, list) and photo_items:
+        largest = photo_items[-1] if isinstance(photo_items[-1], dict) else {}
+        file_id = str(largest.get("file_id") or "").strip()
+        if file_id:
+            media, error = download_telegram_media(
+                file_id=file_id,
+                filename=f"photo_{message_id or file_id}.jpg",
+                mimetype="image/jpeg",
+                message_id=message_id if isinstance(message_id, int) else None,
+            )
+            if error:
+                media = {"error": error}
+    elif isinstance(message.get("document"), dict):
+        document = message["document"]
+        file_id = str(document.get("file_id") or "").strip()
+        if file_id:
+            media, error = download_telegram_media(
+                file_id=file_id,
+                filename=str(document.get("file_name") or "").strip() or None,
+                mimetype=str(document.get("mime_type") or "").strip() or None,
+                message_id=message_id if isinstance(message_id, int) else None,
+            )
+            if error:
+                media = {"error": error}
+
+    return str(text).strip() if isinstance(text, str) else None, chat_id or None, from_me, media, chat_type
+
+
+def process_telegram_update(update: Dict[str, Any]) -> str:
+    text, chat_id, from_me, media, chat_type = extract_telegram_message(update)
+    return process_incoming_message(text, chat_id, from_me, media, chat_type)
+
+
+def send_text(chat_id: str, text: str) -> None:
+    footer = "© Haris Stockbit"
+    if text and not text.rstrip().endswith(footer):
+        text = f"{text.rstrip()}\n\n{footer}"
+
+    result, error = telegram_api_request(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+        },
+    )
+    if error:
+        logger.error("Telegram sendMessage failed for chat_id=%s: %s", chat_id, error)
+        return
+    logger.debug("Telegram sendMessage ok for chat_id=%s message=%s", chat_id, result)
+
+
+def poll_updates_once(offset: Optional[int]) -> Optional[int]:
+    payload: Dict[str, Any] = {
+        "timeout": TELEGRAM_POLL_TIMEOUT_SECONDS,
+        "allowed_updates": ["message"],
+    }
+    if offset is not None:
+        payload["offset"] = offset
+
+    result, error = telegram_api_request("getUpdates", payload)
+    if error:
+        logger.error("Polling Telegram gagal: %s", error)
+        time.sleep(POLL_RETRY_DELAY_SECONDS)
+        return offset
+
+    updates = result if isinstance(result, list) else []
+    next_offset = offset
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        update_id = update.get("update_id")
+        try:
+            status = process_telegram_update(update)
+            logger.debug("Processed Telegram update_id=%s status=%s", update_id, status)
+        except Exception as exc:
+            logger.exception("Failed processing Telegram update_id=%s: %s", update_id, exc)
+        if isinstance(update_id, int):
+            candidate = update_id + 1
+            next_offset = candidate if next_offset is None else max(next_offset, candidate)
+    return next_offset
+
+
+def validate_startup_config() -> None:
+    missing: List[str] = []
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not os.getenv("LINKEDIN_ACCESS_TOKEN", "").strip():
+        missing.append("LINKEDIN_ACCESS_TOKEN")
+    if not os.getenv("LINKEDIN_AUTHOR_URN", "").strip():
+        missing.append("LINKEDIN_AUTHOR_URN")
+    if LOGBOOK_ENABLED:
+        if not LOGBOOK_CAS_LOGIN_URL:
+            missing.append("LOGBOOK_CAS_LOGIN_URL")
+        if not LOGBOOK_FORM_URL:
+            missing.append("LOGBOOK_FORM_URL")
+        if not LOGBOOK_CAS_USERNAME:
+            missing.append("LOGBOOK_CAS_USERNAME")
+        if not LOGBOOK_CAS_PASSWORD:
+            missing.append("LOGBOOK_CAS_PASSWORD")
+    if PORTFOLIO_API_BASE_URL and not PORTFOLIO_API_SECRET:
+        missing.append("PORTFOLIO_API_SECRET")
+
+    if missing:
+        raise RuntimeError("Konfigurasi wajib belum di-set: " + ", ".join(missing))
+
+
+def prepare_telegram_runtime() -> None:
+    validate_startup_config()
+
+    _, error = telegram_api_request(
+        "deleteWebhook",
+        {"drop_pending_updates": TELEGRAM_DROP_PENDING_UPDATES},
+    )
+    if error:
+        raise RuntimeError(error)
+
+    me, me_error = telegram_api_request("getMe")
+    if me_error:
+        raise RuntimeError(me_error)
+    logger.info(
+        "Telegram bot siap. username=@%s drop_pending_updates=%s",
+        (me or {}).get("username"),
+        TELEGRAM_DROP_PENDING_UPDATES,
+    )
+
+
+def run_bot() -> None:
+    prepare_telegram_runtime()
+    offset: Optional[int] = None
+    while True:
+        offset = poll_updates_once(offset)
 
 
 if __name__ == "__main__":
-    port = env_int("PORT", 5000)
-    app.run(host="0.0.0.0", port=port)
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        logger.info("Bot dihentikan manual.")
+    except Exception as exc:
+        logger.exception("Bot gagal start: %s", exc)
+        raise

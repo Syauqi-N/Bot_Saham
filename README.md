@@ -1,333 +1,307 @@
-# Bot Saham WhatsApp (IDX) — AI + LinkedIn Auto Post + MIS Logbook
+# Bot Saham Telegram
+
+Telegram-first automation bot for IDX market lookup, AI assistance, LinkedIn posting, MIS logbook submission, and portfolio CRUD.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Flask](https://img.shields.io/badge/Flask-API-000000?logo=flask&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-Private%20Bot-26A5E4?logo=telegram&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)
-![WAHA](https://img.shields.io/badge/WAHA-WhatsApp%20API-25D366?logo=whatsapp&logoColor=white)
 ![TradingView](https://img.shields.io/badge/Data-TradingView-131722)
-![LinkedIn API](https://img.shields.io/badge/LinkedIn-API-0A66C2?logo=linkedin&logoColor=white)
+![LinkedIn API](https://img.shields.io/badge/LinkedIn-UGC%20Post-0A66C2?logo=linkedin&logoColor=white)
 
-## TL;DR
-- This project turns WhatsApp into a lightweight stock assistant for IDX quotes, market news summaries, and AI chat commands.
-- It is built for users who want fast market context and social posting workflows without switching between multiple tools.
-- It supports a LinkedIn draft-to-publish flow (`!post` -> `!review` -> `!postok`) and MIS logbook submit flow (`!logbook` -> isi materi -> `!ok`).
+## Summary
 
-## Live Demo (Visual)
-<p align="center">
-  <img src="docs/images/06-e2e-post-flow.gif" alt="End-to-end LinkedIn posting flow" width="300" />
-</p>
-*Short E2E demo of draft mode and publish path (`!post` -> input -> `!review` -> `!postok`).*
+- Full Telegram long polling bot, no WAHA, no webhook HTTP ingress.
+- Private chat only. Group, supergroup, channel, and bot messages are ignored.
+- Stateful workflows are built into the bot:
+  - `!post` for LinkedIn image post drafts
+  - `!logbook` for MIS logbook submission
+  - `!porto` for portfolio CRUD via protected admin API
 
-## Problem & Solution
-**Problem**
-- Stock checks, news tracking, and social posting are often fragmented across different apps.
-- Manual copy-paste to publish content (for example to LinkedIn) adds friction and delays.
+## What It Handles
 
-**Solution**
-- A WhatsApp-first command bot that centralizes market lookup, AI-assisted context, and LinkedIn draft-based auto-posting in one flow.
-- Users can gather signal and publish faster from chat, with fewer context switches.
+### Market and AI
+- `$KODE` for IDX stock quote with support/resistance
+- `!ihsg` for IHSG overview
+- `!news <topic>` for news aggregation plus AI summary
+- `!ai <text>` for general AI chat
+- `!explain <backend problem>` for backend mentor mode
 
-## Key Features
-- `$KODE` (example: `$BBCA`) -> IDX quote + support/resistance snapshot
-- `!ihsg` -> IHSG index check
-- `!news <topic>` -> latest news aggregation (multi-source) + AI summary
-- `!ai <text>` -> general AI chat response
-- `!explain <text>` -> backend mentor assistant mode
-- `!post` -> start LinkedIn draft mode (caption + up to 3 images)
-- `!review` -> review current LinkedIn draft before posting
-- `!postok` -> publish draft to LinkedIn
-- `!cancelpost` -> cancel current draft session
-- `!logbook` -> start MIS logbook mode
-- `!ok` -> submit current logbook draft to MIS
-- `!update` -> replace logbook activity/material text
-- `!cancel` -> cancel current logbook session
+### LinkedIn Draft Workflow
+- `!post` starts a draft
+- Send caption and up to 3 images in private chat
+- `!review` previews the active draft
+- `!postok` publishes the draft to LinkedIn
+- `!cancelpost` drops the draft
+
+### MIS Logbook Workflow
+- `!logbook` starts a session
+- Send material/activity text
+- `!ok` submits the draft to MIS
+- After submit, upload optional PDF or JPG/JPEG evidence
+- `!skip` finishes without file upload
+- `!update` changes the material before submit
+- `!cancel` cancels the active logbook session
+
+### Portfolio CRUD Workflow
+- `!porto` starts a guided wizard
+- Supports:
+  - list projects
+  - add project
+  - edit project
+  - delete project
+  - edit profile
+  - edit social links
+- Common in-session commands:
+  - `menu`
+  - `back`
+  - `save`
+  - `cancel`
+  - `exit`
 
 ## Architecture
+
 ```mermaid
 flowchart LR
-    U[WhatsApp User] --> W[WAHA Webhook]
-    W --> B[Flask Bot: bot_saham.py]
+    U[Telegram User] --> T[Telegram Bot API]
+    T --> B[Python Bot]
 
-    B --> T[TradingView via tvDatafeed]
-    B --> N[Google News + RSS Feeds]
+    B --> V[TradingView via tvDatafeed]
+    B --> N[Google News RSS]
     B --> G[Groq API]
     B --> S[Backend Savior API]
     B --> L[LinkedIn API]
     B --> C[CAS Login PENS]
-    C --> M[Online MIS Logbook]
+    B --> M[Online MIS Logbook]
+    B --> P[Portfolio Admin API]
 
-    B --> R[WAHA sendText]
-    R --> U
+    B --> T
 ```
 
-Core components:
-- **Ingress**: WAHA sends chat events to `/webhook`
-- **Orchestrator**: Flask bot parses commands, applies rate-limit/session logic, and routes to services
-- **Market Data**: TradingView (`tvDatafeed`) for IDX quote and IHSG
-- **Content + AI**: Google News RSS + Groq summary/chat + backend mentor mode
-- **Social Distribution**: LinkedIn image post pipeline (draft, review, publish)
-- **Campus Automation**: CAS-authenticated MIS logbook form submit
+Core pieces:
+- `bot_saham.py` orchestrates command parsing, rate limiting, Telegram polling, and stateful sessions.
+- `news_client.py` handles source fetch and filtering for `!news`.
+- `linkedin_client.py` handles media upload and UGC post creation.
+- `mis_logbook_client.py` handles CAS login, form submit, and optional file upload.
+- Portfolio operations call a separate website admin API with `X-Portfolio-Secret`.
 
-## End-to-End Flows
-### Flow A — Stock / News Query
-1. User sends `$KODE`, `!ihsg`, or `!news <topic>` in WhatsApp.
-2. WAHA forwards message payload to Flask webhook.
-3. Bot routes command to TradingView or news+AI pipeline.
-4. Bot formats response and sends result back via WAHA.
+## Commands
 
-### Flow B — LinkedIn Draft Posting
-1. User sends `!post` to activate draft mode.
-2. User sends up to 3 images and caption (single or separate messages).
-3. User sends `!review` to inspect draft readiness.
-4. User sends `!postok` to publish to LinkedIn (`!cancelpost` to abort).
-5. Bot confirms success/failure and closes draft session.
+| Command | Purpose |
+|---|---|
+| `$BBCA` | Quote saham IDX + support/resistance |
+| `!ihsg` | Ringkasan IHSG |
+| `!help` | Bantuan singkat |
+| `!news tech` | Berita + AI summary |
+| `!ai ...` | Chat AI umum |
+| `!explain ...` | Mode mentor backend |
+| `!post` | Mulai draft LinkedIn |
+| `!review` | Review draft LinkedIn |
+| `!postok` | Publish draft LinkedIn |
+| `!cancelpost` | Batalkan draft LinkedIn |
+| `!logbook` | Mulai sesi logbook |
+| `!ok` | Submit logbook |
+| `!update` | Update materi logbook |
+| `!skip` | Lewati upload bukti logbook |
+| `!cancel` | Batalkan sesi logbook aktif |
+| `!porto` | Buka wizard CRUD portfolio |
 
-### Flow C — MIS Logbook Submit
-1. User sends `!logbook` to activate logbook mode.
-2. User sends `Kegiatan/Materi` text manually.
-3. Bot sends draft summary (tanggal/jam/matkul default + materi).
-4. User sends `!ok` to submit (`!update` untuk ganti materi, `!cancel` untuk batal).
-5. Bot login ke CAS, submit logbook ke MIS via AJAX, lalu kirim hasilnya ke chat.
+## `!porto` Wizard
 
-#### Technical Detail — How MIS Submission Works
+Main menu:
 
-The MIS logbook page (`mEntry_Logbook_KP1.php`) is a **JavaScript shell page** — its form body is empty in raw HTML and is populated entirely by a JavaScript AJAX call on page load:
+```txt
+!porto
 
-```html
-<body onload="showEntry_Logbook_KP1(2025, 2, 9)">
-<form id="kirim">
-  <div id="tdData"></div>  <!-- filled by JS -->
-</form>
-<script src="japascript/absen.js"></script>
+1. Lihat projects
+2. Tambah project
+3. Edit project
+4. Hapus project
+5. Edit profile
+6. Edit social links
+0. Keluar
 ```
 
-Because the bot uses Python `requests` (no browser, no JS execution), it cannot rely on the shell page. Instead, it **replicates the JavaScript behavior manually**:
+Example add-project flow:
 
-**Step 1 — CAS Login**
-```
-GET  login.pens.ac.id/cas/login  →  parse form (hidden fields: lt, _eventId)
-POST CAS with username + password + hidden fields  →  get session cookie
-```
-
-**Step 2 — Fetch shell page, extract AJAX parameters**
-```
-GET  mEntry_Logbook_KP1.php
-Read onload="showEntry_Logbook_KP1(2025, 2, 9)"
-                              └tahun┘  └sem┘  └minggu┘
-```
-
-**Step 3 — Fetch the real form via AJAX URL**
-```
-GET  entry_logbook_kp1.php?valTahun=2025&valSemester=2&valMinggu=9
-Read hidden fields:
-  - kp_daftar  (KP registration ID)
-  - mahasiswa  (student DB ID)
-  - tanggal    (server-provided date: YYYY-MM-DD)
-  - matakuliah options (dropdown choices)
-  - valnrpMahasiswa (NRP from onclick button)
+```txt
+!porto
+2
+New Project
+new-project
+Short summary
+2
+yes
+Python, Telegram Bot API
+Deskripsi project
+save
 ```
 
-**Step 4 — POST submission (replicating `simpan_data_logbook1` JS function)**
+The bot keeps the session state per chat and guides the user step by step instead of relying on raw one-line commands.
 
-The Simpan button in browser calls:
-```js
-onclick="simpan_data_logbook1(2423600049, 2025, 2, 9)"
-// which does: POST entry_logbook_kp1.php with Simpan=1 + all field values
-```
+## Setup
 
-The bot replicates this exact POST:
-```
-POST  entry_logbook_kp1.php
-body: valnrpMahasiswa=2423600049 + valTahun=2025 + valSemester=2 + valMinggu=9
-    + Simpan=1 + tanggal=2026-03-03 + jam_mulai=08:00 + jam_selesai=17:00
-    + kegiatan=<materi> + sesuai_kuliah=1 + matakuliah=<id> 
-    + kp_daftar=7254 + mahasiswa=24190 + Setuju=1
-```
+### 1. Create environment
 
-> **Key insight**: Hidden fields (`kp_daftar`, `mahasiswa`, `tanggal`) are values pre-filled by the server and not visible to the user. The bot fetches these from the AJAX page HTML before submitting, so the server receives a complete and valid payload — identical to what a browser would send.
-
-
-
-## Screenshots
-
-<p align="center">
-  <img src="docs/images/01-overview-chat-commands.png" alt="Chat command overview" width="300" />
-</p>
-*Command overview in WhatsApp conversation context.*
-
-<p align="center">
-  <img src="docs/images/02-post-mode-input.png" alt="LinkedIn post mode input" width="300" />
-</p>
-*User sends media + caption while draft mode is active.*
-
-<p align="center">
-  <img src="docs/images/03-review-draft.png" alt="Draft review output" width="300" />
-</p>
-*`!review` shows draft status before publish.*
-
-<p align="center">
-  <img src="docs/images/04-post-publish-success.png" alt="LinkedIn publish success" width="300" />
-</p>
-*Bot confirms successful publishing result after `!postok`.*
-
-<p align="center">
-  <img src="docs/images/05-waha-webhook-settings.png" alt="WAHA webhook settings" width="300" />
-</p>
-*Webhook configuration page in WAHA dashboard.*
-
-## Quick Start
-### 1) Setup Bot
 ```bash
 cd ~/Documents/bot_saham2
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-python bot_saham.py
 ```
 
-### 2) Run WAHA
+### 2. Create Telegram bot
+
+1. Open `@BotFather`
+2. Run `/newbot`
+3. Copy the token into `TELEGRAM_BOT_TOKEN`
+4. Run `/setjoingroups` and choose `Disable`
+
+### 3. Run locally
+
 ```bash
-docker run -d --name backend-waha-1 -p 3000:3000 devlikeapro/waha:latest
+python3 bot_saham.py
 ```
-Then open: `http://localhost:3000/dashboard`
 
-### 3) Configure Webhook
-Set WAHA webhook URL to one of:
-- `http://host.docker.internal:5000/webhook`
-- `http://172.17.0.1:5000/webhook`
+Or with Docker:
 
-### 4) Quick Local Simulation
 ```bash
-python scripts/simulate_webhook.py --text '$BBCA'
-python scripts/simulate_webhook.py --text '!news tech'
-python scripts/simulate_webhook.py --text '!post'
-python scripts/simulate_webhook.py --text 'Draft caption test' --media-url 'https://example.com/image.jpg' --media-mimetype 'image/jpeg'
-python scripts/simulate_webhook.py --text '!review'
-python scripts/simulate_webhook.py --text '!postok'
-python scripts/simulate_webhook.py --logbook-demo
+docker compose up --build -d
 ```
+
+## Quick Check
+
+DM the bot in Telegram and try:
+
+- `$BBCA`
+- `!news tech`
+- `!ai why is IHSG weak today?`
+- `!post`
+- `!logbook`
+- `!porto`
 
 ## Environment Variables
-### WAHA
-| Variable | Default | Description |
-|---|---|---|
-| `WAHA_BASE_URL` | `http://localhost:3000` | WAHA API base URL |
-| `WAHA_SESSION` | `default` | WAHA session name |
-| `WAHA_API_KEY` | - | WAHA API key (if enabled) |
 
-### Runtime
+### Telegram
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `5000` | Flask app port |
-| `LOG_LEVEL` | `INFO` | Logging level |
-| `CACHE_TTL_SECONDS` | `60` | Cache TTL |
-| `RATE_LIMIT_SECONDS` | `5` | Per-chat rate-limit window |
-| `NEWS_MAX_ITEMS` | `5` | Max news items per query |
-| `NEWS_HTTP_TIMEOUT` | `8` | HTTP timeout per news source request (seconds) |
-| `NEWS_RELAX_DAYS` | `7` | Fallback day range when strict 1-day search is empty |
-| `NEWS_PER_SOURCE_MULTIPLIER` | `3` | Fetch multiplier per source before dedupe/filter |
-| `NEWS_SITE_SOURCES` | `cnbcindonesia.com,kontan.co.id,bisnis.com,idxchannel.com` | Domain list for Google site search |
-| `NEWS_DIRECT_FEEDS` | `https://www.antaranews.com/rss/ekonomi.xml` | Extra direct RSS feeds (comma-separated, supports `{query}` placeholder) |
+| `TELEGRAM_BOT_TOKEN` | - | Bot token from `@BotFather` |
+| `TELEGRAM_API_BASE_URL` | `https://api.telegram.org` | Telegram Bot API base URL |
+| `TELEGRAM_POLL_TIMEOUT_SECONDS` | `30` | `getUpdates` long polling timeout |
+| `TELEGRAM_DROP_PENDING_UPDATES` | `true` | Drop pending updates on startup |
 
-### Market Data (TradingView)
+### Market Data
 | Variable | Default | Description |
 |---|---|---|
-| `TRADINGVIEW_USERNAME` | - | TradingView username (optional) |
-| `TRADINGVIEW_PASSWORD` | - | TradingView password (optional) |
-| `TV_INTERVAL` | `1d` | Quote interval (`1m/5m/15m/1h/1d`) |
-| `TV_BARS` | `2` | Number of bars for quote calculation |
-| `IHSG_SYMBOL` | `COMPOSITE` | IHSG symbol in TradingView |
+| `TRADINGVIEW_USERNAME` | - | TradingView username, optional |
+| `TRADINGVIEW_PASSWORD` | - | TradingView password, optional |
+| `TV_INTERVAL` | `1d` | Quote interval |
+| `TV_BARS` | `2` | Bars used for quote calculation |
+| `IHSG_SYMBOL` | `COMPOSITE` | Symbol for IHSG |
 
 ### AI and News
 | Variable | Default | Description |
 |---|---|---|
-| `GROQ_API_KEY` | - | API key for `!ai` and news summarization |
+| `GROQ_API_KEY` | - | Required for `!ai` and `!news` summary |
 | `GROQ_MODEL` | `groq/compound-mini` | Groq model |
 | `GROQ_API_URL` | `https://api.groq.com/openai/v1/chat/completions` | Groq endpoint |
-| `BACKEND_SAVIOR_API_KEY` | - | API key for `!explain` |
+| `BACKEND_SAVIOR_API_KEY` | - | Required for `!explain` |
 | `BACKEND_SAVIOR_BASE_URL` | `https://integrate.api.nvidia.com/v1` | Backend mentor provider base URL |
 | `BACKEND_SAVIOR_MODEL` | `z-ai/glm5` | Backend mentor model |
 | `BACKEND_SAVIOR_DEBUG` | `true` | Show technical error details |
 | `BACKEND_SAVIOR_MAX_TOKENS` | `700` | Max output tokens |
-| `BACKEND_SAVIOR_TIMEOUT_CONNECT` | `10` | Connect timeout (seconds) |
-| `BACKEND_SAVIOR_TIMEOUT_READ` | `45` | Read timeout (seconds) |
+| `BACKEND_SAVIOR_TIMEOUT_CONNECT` | `10` | Connect timeout |
+| `BACKEND_SAVIOR_TIMEOUT_READ` | `45` | Read timeout |
 | `BACKEND_SAVIOR_RETRIES` | `2` | Retry count |
-| `BACKEND_SAVIOR_RETRY_BACKOFF_SECONDS` | `1.2` | Exponential backoff base |
-| `BACKEND_SAVIOR_FALLBACK_TO_GROQ` | `true` | Use Groq fallback for retryable Backend Savior failures (`timeout`, `5xx`, `429`) |
-| `BACKEND_SAVIOR_FALLBACK_MAX_TOKENS` | `450` | Max output tokens for Groq fallback |
+| `BACKEND_SAVIOR_RETRY_BACKOFF_SECONDS` | `1.2` | Retry backoff base |
+| `BACKEND_SAVIOR_FALLBACK_TO_GROQ` | `true` | Use Groq fallback for retryable failures |
+| `BACKEND_SAVIOR_FALLBACK_MAX_TOKENS` | `450` | Max tokens for fallback |
+| `NEWS_MAX_ITEMS` | `5` | Max items per `!news` request |
+| `NEWS_HTTP_TIMEOUT` | `8` | Timeout per source request |
+| `NEWS_RELAX_DAYS` | `7` | Relaxed day range if strict search is empty |
+| `NEWS_PER_SOURCE_MULTIPLIER` | `3` | Fetch multiplier before dedupe |
+| `NEWS_SITE_SOURCES` | `cnbcindonesia.com,...` | Google site search source list |
+| `NEWS_DIRECT_FEEDS` | `https://www.antaranews.com/rss/ekonomi.xml` | Additional direct RSS feeds |
 
-### LinkedIn Posting
+### LinkedIn
 | Variable | Default | Description |
 |---|---|---|
-| `LINKEDIN_ACCESS_TOKEN` | - | OAuth access token |
-| `LINKEDIN_AUTHOR_URN` | - | Author URN, example `urn:li:person:xxxx` |
+| `LINKEDIN_ACCESS_TOKEN` | - | Required for LinkedIn publishing |
+| `LINKEDIN_AUTHOR_URN` | - | LinkedIn author URN |
+| `LINKEDIN_ALLOWED_CHAT_IDS` | - | Optional allowlist for `!post` |
 | `LINKEDIN_API_BASE_URL` | `https://api.linkedin.com` | LinkedIn API base URL |
-| `LINKEDIN_TIMEOUT_CONNECT` | `10` | Connect timeout (seconds) |
-| `LINKEDIN_TIMEOUT_READ` | `45` | Read timeout (seconds) |
-| `POST_SESSION_TTL_SECONDS` | `900` | Draft session TTL per chat |
-| `LINKEDIN_CAPTION_MAX_CHARS` | `3000` | Caption character limit |
-| `LINKEDIN_MAX_IMAGES` | `3` | Maximum images per LinkedIn draft/post (1-3) |
+| `LINKEDIN_TIMEOUT_CONNECT` | `10` | Connect timeout |
+| `LINKEDIN_TIMEOUT_READ` | `45` | Read timeout |
+| `POST_SESSION_TTL_SECONDS` | `900` | Draft TTL per chat |
+| `LINKEDIN_CAPTION_MAX_CHARS` | `3000` | Max caption length |
+| `LINKEDIN_MAX_IMAGES` | `3` | Max image count per post |
 
 ### MIS Logbook
 | Variable | Default | Description |
 |---|---|---|
-| `LOGBOOK_ENABLED` | `true` | Enable/disable `!logbook` flow |
-| `LOGBOOK_ALLOWED_CHAT_IDS` | - | Comma-separated allowed chat IDs (required) |
-| `LOGBOOK_CAS_LOGIN_URL` | CAS login URL + service MIS | CAS login endpoint |
-| `LOGBOOK_FORM_URL` | `https://online.mis.pens.ac.id/mEntry_Logbook_KP1.php` | Target logbook form page |
+| `LOGBOOK_ENABLED` | `true` | Enable logbook flow |
+| `LOGBOOK_ALLOWED_CHAT_IDS` | - | Required allowlist for `!logbook` |
+| `LOGBOOK_CAS_LOGIN_URL` | MIS CAS URL | CAS login URL |
+| `LOGBOOK_FORM_URL` | MIS form URL | MIS logbook form URL |
 | `LOGBOOK_CAS_USERNAME` | - | CAS username |
 | `LOGBOOK_CAS_PASSWORD` | - | CAS password |
-| `LOGBOOK_DEFAULT_START_TIME` | `08:00` | Default jam mulai |
-| `LOGBOOK_DEFAULT_END_TIME` | `17:00` | Default jam selesai |
-| `LOGBOOK_DEFAULT_RELATED` | `true` | Default radio "sesuai matkul" |
-| `LOGBOOK_DEFAULT_COURSE_KEYWORD` | `RI042106` | Keyword pencarian opsi matkul |
-| `LOGBOOK_DEFAULT_CHECKBOX` | `true` | Default checkbox pernyataan |
-| `LOGBOOK_TIMEOUT_CONNECT` | `10` | Connect timeout (seconds) |
-| `LOGBOOK_TIMEOUT_READ` | `45` | Read timeout (seconds) |
-| `LOGBOOK_MATERIAL_MAX_CHARS` | `4000` | Max karakter kegiatan/materi |
+| `LOGBOOK_DEFAULT_START_TIME` | `08:00` | Default start time |
+| `LOGBOOK_DEFAULT_END_TIME` | `17:00` | Default end time |
+| `LOGBOOK_DEFAULT_RELATED` | `true` | Default related-course checkbox |
+| `LOGBOOK_DEFAULT_COURSE_KEYWORD` | `RI042106` | Default course keyword |
+| `LOGBOOK_DEFAULT_CHECKBOX` | `true` | Default agreement checkbox |
+| `LOGBOOK_TIMEOUT_CONNECT` | `10` | Connect timeout |
+| `LOGBOOK_TIMEOUT_READ` | `45` | Read timeout |
+| `LOGBOOK_MATERIAL_MAX_CHARS` | `4000` | Max material length |
 
-## Deployment (Private Server)
-Recommended workflow for your current setup (update on laptop, deploy on private server):
+### Portfolio API
+| Variable | Default | Description |
+|---|---|---|
+| `PORTFOLIO_API_BASE_URL` | - | Portfolio website base URL |
+| `PORTFOLIO_API_SECRET` | - | Shared secret for protected admin API |
+| `PORTFOLIO_ALLOWED_CHAT_IDS` | - | Required allowlist for `!porto` |
 
-### Laptop (build and push)
-```bash
-docker build -t <registry>/bot-saham:<tag> .
-docker push <registry>/bot-saham:<tag>
-```
+### Runtime
+| Variable | Default | Description |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | Log level |
+| `CACHE_TTL_SECONDS` | `60` | Quote/news cache TTL |
+| `RATE_LIMIT_SECONDS` | `5` | Per-chat rate limit window |
 
-### Private server (pull and recreate bot)
-```bash
-docker compose pull bot
-docker compose up -d --no-deps --force-recreate bot
-```
+## Runtime Notes
 
-Notes:
-- If bot and WAHA run in the same Docker Compose network, use `WAHA_BASE_URL=http://waha:3000`.
-- `localhost` only works when bot runs directly on host (non-container) and WAHA is exposed on host port 3000.
+- The bot calls `deleteWebhook` on startup and then uses `getUpdates`.
+- Telegram media is fetched through `getFile`, downloaded, and converted to base64 in memory.
+- Startup fails fast if required config is missing:
+  - always: `TELEGRAM_BOT_TOKEN`, `LINKEDIN_ACCESS_TOKEN`, `LINKEDIN_AUTHOR_URN`
+  - if `LOGBOOK_ENABLED=true`: `LOGBOOK_CAS_LOGIN_URL`, `LOGBOOK_FORM_URL`, `LOGBOOK_CAS_USERNAME`, `LOGBOOK_CAS_PASSWORD`
+  - if `PORTFOLIO_API_BASE_URL` is set: `PORTFOLIO_API_SECRET`
+- `!post`, `!logbook`, and `!porto` are stateful. The bot rejects overlapping flows in the same chat.
 
 ## Troubleshooting
-- **WAHA media fetch fails during `!postok`**:
-  - Verify `WAHA_BASE_URL` from inside bot container is reachable (for compose: `http://waha:3000`).
-- **LinkedIn auth errors (`invalid_client`, `unauthorized_scope_error`)**:
-  - Rotate secret if exposed, verify redirect URI exact match, and request proper scopes.
-- **No response for a command**:
-  - Confirm webhook event type is `message` or `message.any` and session status is `WORKING`.
-- **Draft not found**:
-  - Draft state is in-memory; restarting bot resets active draft sessions.
-- **`!logbook` ditolak dengan "tidak diizinkan"**:
-  - Pastikan `LOGBOOK_ALLOWED_CHAT_IDS` berisi `chatId` WA yang benar.
-- **Login CAS gagal saat `!ok`**:
-  - Verifikasi `LOGBOOK_CAS_USERNAME`, `LOGBOOK_CAS_PASSWORD`, dan `LOGBOOK_CAS_LOGIN_URL`.
-- **Matkul tidak ditemukan saat submit logbook**:
-  - Ubah `LOGBOOK_DEFAULT_COURSE_KEYWORD` agar match dengan value/teks opsi dropdown di MIS.
 
-## Author
-**Syauqi Naufal**  
-Backend-focused builder working on chat automation, market tooling, and API integrations.
+- **Bot does not respond in Telegram**
+  - Check `TELEGRAM_BOT_TOKEN`
+  - Make sure the bot is running
+  - Make sure you are sending messages in private chat, not a group
 
-- GitHub: [github.com/Syauqi-N](https://github.com/Syauqi-N)
-- LinkedIn: [linkedin.com](https://www.linkedin.com/in/syauqi-naufal/)
+- **`!post` is rejected**
+  - Check `LINKEDIN_ALLOWED_CHAT_IDS`
+  - Check LinkedIn token and author URN
 
-## License
-MIT
+- **`!logbook` fails or is rejected**
+  - Check `LOGBOOK_ALLOWED_CHAT_IDS`
+  - Check CAS login URL, form URL, username, and password
+
+- **`!porto` fails or is rejected**
+  - Check `PORTFOLIO_ALLOWED_CHAT_IDS`
+  - Check `PORTFOLIO_API_BASE_URL`
+  - Check `PORTFOLIO_API_SECRET`
+
+- **Logbook upload fails**
+  - Send PDF or JPG/JPEG only
+  - Upload after `!ok`, or use `!skip`
+
+- **News or AI result is empty**
+  - Check `GROQ_API_KEY`
+  - Check news source reachability and timeout settings
