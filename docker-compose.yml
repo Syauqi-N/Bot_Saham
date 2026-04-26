@@ -1,7 +1,7 @@
 services:
   bot:
     build: .
-    container_name: bot-saham
+    container_name: bot-saham-public
     env_file:
       - .env
     restart: unless-stopped

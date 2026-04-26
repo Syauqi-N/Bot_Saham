@@ -1,5 +1,4 @@
 import base64
-import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -36,13 +35,9 @@ def telegram_update(
 
 class TelegramRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
-        bot_saham.post_drafts.clear()
-        bot_saham.logbook_sessions.clear()
         bot_saham.rate_limit.clear()
 
     def tearDown(self) -> None:
-        bot_saham.post_drafts.clear()
-        bot_saham.logbook_sessions.clear()
         bot_saham.rate_limit.clear()
 
     def test_extract_telegram_text_message(self) -> None:
@@ -142,17 +137,6 @@ class TelegramRuntimeTests(unittest.TestCase):
     def test_prepare_telegram_runtime_calls_delete_webhook(self) -> None:
         with patch.object(bot_saham, "TELEGRAM_BOT_TOKEN", "123:token"), patch.object(
             bot_saham,
-            "LOGBOOK_ENABLED",
-            False,
-        ), patch.dict(
-            os.environ,
-            {
-                "LINKEDIN_ACCESS_TOKEN": "li-token",
-                "LINKEDIN_AUTHOR_URN": "urn:li:person:1",
-            },
-            clear=False,
-        ), patch.object(
-            bot_saham,
             "telegram_api_request",
             side_effect=[(True, None), ({"username": "harisbot"}, None)],
         ) as mock_api:
@@ -164,6 +148,35 @@ class TelegramRuntimeTests(unittest.TestCase):
             {"drop_pending_updates": bot_saham.TELEGRAM_DROP_PENDING_UPDATES},
         )
         self.assertEqual(mock_api.call_args_list[1].args[0], "getMe")
+
+    def test_private_commands_are_ignored_in_public_bot(self) -> None:
+        with patch.object(bot_saham, "send_text") as mock_send:
+            post_status = bot_saham.process_incoming_message("!post", "123456789", False, None, "private")
+            logbook_status = bot_saham.process_incoming_message("!logbook", "123456789", False, None, "private")
+            porto_status = bot_saham.process_incoming_message("!porto", "123456789", False, None, "private")
+            explain_status = bot_saham.process_incoming_message(
+                "!explain bagaimana retry queue",
+                "123456789",
+                False,
+                None,
+                "private",
+            )
+
+        self.assertEqual(post_status, "ignored")
+        self.assertEqual(logbook_status, "ignored")
+        self.assertEqual(porto_status, "ignored")
+        self.assertEqual(explain_status, "ignored")
+        self.assertEqual(mock_send.call_count, 0)
+
+    def test_help_text_does_not_show_private_workflows(self) -> None:
+        text = bot_saham.help_text()
+
+        self.assertIn("!ai", text)
+        self.assertIn("!news", text)
+        self.assertNotIn("!post", text)
+        self.assertNotIn("!logbook", text)
+        self.assertNotIn("!porto", text)
+        self.assertNotIn("!explain", text)
 
 
 if __name__ == "__main__":
